@@ -32,3 +32,7 @@ src-tauri/.env
 # Build outputs
 dist/
 src-tauri/target/
+
+# Tauri Updater Private Keys (CRITICAL: NEVER COMMIT)
+*.key
+*.pem

@@ -10,6 +10,7 @@ import ChatView from './components/ChatView';
 import SocialView from './features/social/SocialView'; // Phase 9: Social Layer
 import { useNotifications } from './hooks/useNotifications'; // Phase 5 Hook
 import StatusView from './features/social/StatusView';
+import { useUpdater } from './hooks/useUpdater';
 
 const Analytics = lazy(() => import('./components/Analytics'));
 
@@ -28,6 +29,8 @@ const App: React.FC = () => {
   // Phase 5: Initialize background notification polling (Strictly Additive)
   // Placed before early returns to strictly follow the Rules of Hooks.
   useNotifications();
+
+  useUpdater();
 
   // Phase 7: Global Command Palette Shortcut (Ctrl+K / Cmd+K)
   useEffect(() => {
