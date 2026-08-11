@@ -17,6 +17,10 @@
     "core:image:default",
     "opener:default",
     "store:default",
-    "notification:default"
+    "notification:default",
+    "updater:default",
+    "process:default",
+    "process:allow-relaunch",
+    "process:allow-exit"
   ]
 }

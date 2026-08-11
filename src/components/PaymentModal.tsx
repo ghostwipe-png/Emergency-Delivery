@@ -39,8 +39,6 @@ export default function PaymentModal({
   const [phase, setPhase] = useState<Phase>('select');
   const [reference, setReference] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
-  
-  // PHASE 15: Track split credits added for the success screen
   const [addedCredits, setAddedCredits] = useState<{ emails: number; sms: number } | null>(null);
   
   const pollRef = useRef<number | null>(null);
@@ -60,7 +58,7 @@ export default function PaymentModal({
     setSelected(null);
     setMessage(null);
     setReference(null);
-    setAddedCredits(null); // Reset Phase 15 state
+    setAddedCredits(null);
     onClose();
     onCancel?.();
   }, [stopPolling, onClose, onCancel]);
@@ -86,25 +84,21 @@ export default function PaymentModal({
     try {
       const result: any = await api.verifyPayment(sessionToken, reference);
       
-      // Check for successful verification
       const isVerified = result?.verified === true || result?.status === 'success' || result?.success === true;
       
       if (isVerified) {
         stopPolling();
         setPhase('success');
-        
-        // PHASE 15: Capture the exact split credits added
         setAddedCredits({ 
           emails: result?.emails_added || 0, 
           sms: result?.sms_added || 0 
         });
-        
-        setMessage(result?.message || 'Payment verified successfully! Credits added.');
+        setMessage(result?.message || 'Payment verified successfully!');
         await refreshUser();
         setTimeout(() => {
           onSuccess?.();
           handleClose();
-        }, 2500); // Slightly longer delay so they can see the split credits
+        }, 2500);
       } else {
         setMessage("Payment not completed yet. Please finish the payment in your browser.");
       }
@@ -118,7 +112,7 @@ export default function PaymentModal({
     let attempts = 0;
     pollRef.current = window.setInterval(async () => {
       attempts += 1;
-      if (attempts > 60) { // ~4 minutes timeout
+      if (attempts > 60) {
         stopPolling();
         setMessage("Timed out waiting for payment. Use 'Verify now' after paying.");
         return;
@@ -133,7 +127,6 @@ export default function PaymentModal({
     setMessage(null);
     
     try {
-      // Note: Ensure your api.ts passes { plan_id: selected } if the backend expects an object
       const res: any = await api.initializePayment(sessionToken, selected);
       const authUrl = res?.authorization_url || res?.authorizationUrl || res?.url;
       const ref = res?.reference || res?.ref || res?.id;
@@ -169,7 +162,7 @@ export default function PaymentModal({
           ✕
         </button>
 
-        <h2 className="text-xl font-bold text-[#e9edef] pr-8">Buy Delivery Credits</h2>
+        <h2 className="text-xl font-bold text-[#e9edef] pr-8">Buy Credits</h2>
         <p className="text-sm text-[#8696a0] mt-1">Secure checkout powered by Paystack (KES).</p>
 
         {/* SELECT PLAN PHASE */}
@@ -179,11 +172,10 @@ export default function PaymentModal({
               {plans.length === 0 && !message && (
                 <p className="text-sm text-[#8696a0] text-center py-4 animate-pulse">Loading plans...</p>
               )}
+              
               {plans.map((plan: any) => {
                 const planId = String(plan.id);
                 const isSelected = selected === planId;
-                
-                // PHASE 15: price_in_kobo is in cents. Divide by 100 to show actual KES.
                 const priceKES = (plan.price_in_kobo ?? 0) / 100;
                 
                 return (
@@ -287,7 +279,6 @@ export default function PaymentModal({
             <div>
               <h3 className="text-lg font-bold text-[#e9edef]">Payment Successful!</h3>
               
-              {/* PHASE 15: Show exact split credits added */}
               {addedCredits && (
                 <div className="flex justify-center gap-4 mt-3 text-sm font-bold bg-[#202c33] py-2 px-4 rounded-lg inline-flex">
                   <span className="text-[#00a884]">+{addedCredits.emails.toLocaleString()} ✉️</span>
