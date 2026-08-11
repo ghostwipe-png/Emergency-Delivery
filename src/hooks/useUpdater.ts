@@ -6,25 +6,25 @@ export function useUpdater() {
   useEffect(() => {
     const checkUpdates = async () => {
       try {
+        console.log('Checking for updates...');
         const update = await check();
+        
         if (update) {
-          console.log(`Update found: ${update.version}`);
-          
-          // For MVP, we use a simple browser-style confirmation dialog.
-          // You can replace this with a fancy custom modal later!
+          alert(`✅ Update found: ${update.version}`);
           const shouldInstall = window.confirm(
             `🚀 A new version (${update.version}) of Emergency Delivery is available!\n\nWould you like to download and install it now?`
           );
-          
           if (shouldInstall) {
-            console.log('Downloading update...');
             await update.downloadAndInstall();
-            console.log('Update installed. Restarting app...');
             await relaunch();
           }
+        } else {
+          // This happens if the version in latest.json is <= your current app version, OR if the fetch failed silently
+          alert('ℹ️ No update found. (This means latest.json was missing, returned 404, or versions match).');
         }
-      } catch (error) {
-        console.error('Failed to check for updates:', error);
+      } catch (error: any) {
+        // This will catch network errors, CSP blocks, or JSON parsing errors
+        alert(`❌ Update Error:\n${error.message || error.toString()}`);
       }
     };
 
