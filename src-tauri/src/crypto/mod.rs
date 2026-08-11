@@ -1,6 +1,34 @@
 //! Authenticated encryption (AES-256-GCM), PBKDF2 key derivation and secure
 //! random generation. All long-lived keys are wrapped in `Zeroizing` so key
 //! material is wiped from memory on drop.
+//!
+//! # Cross-Platform Contract (Rust ↔ Web Worker Claim Page)
+//!
+//! When a user sends a **password-protected delivery**, the file DEK is wrapped
+//! with a user-supplied password and stored in the DB column `claim_pw_wrapped_dek`.
+//! The worker-side claim page MUST decrypt it with the **exact same parameters**:
+//!
+//! ```text
+//! claim_pw_wrapped_dek format (FIELD_VERSION = "v1"):
+//!   "v1:<base64(nonce)>:<base64(ciphertext_with_auth_tag)>"
+//!
+//! claim_password_salt format:
+//!   Hex-encoded raw bytes (e.g. "a1b2c3..."), NOT the string itself.
+//!
+//! Key derivation (PBKDF2-HMAC-SHA256):
+//!   iterations = PBKDF2_ITERATIONS (= 210_000)
+//!   salt       = hex_decode(claim_password_salt)  <- RAW bytes, 16 long
+//!   dkLen      = 32 bytes
+//!   hash       = SHA-256
+//!
+//! Payload inside the wrapped field:
+//!   hex-encoded 32-byte DEK (64 hex chars). After decrypting the outer AES-GCM
+//!   ciphertext, hex-decode the plaintext to recover the raw DEK bytes used to
+//!   decrypt the actual file.
+//! ```
+//!
+//! Changing any of the above (iteration count, salt encoding, envelope format,
+//! or inner encoding) will silently break password-protected deliveries.
 
 use aes_gcm::aead::{Aead, AeadCore, KeyInit, OsRng};
 use aes_gcm::Aes256Gcm;
@@ -11,10 +39,18 @@ use zeroize::Zeroizing;
 use crate::errors::AppError;
 
 /// OWASP-recommended minimum for PBKDF2-HMAC-SHA256 is 100k; we use 210k.
+///
+/// ⚠️  If you change this value, you MUST update the claim page's
+///     `PBKDF2_ITERATIONS` constant to the identical value, otherwise
+///     password-protected deliveries will permanently fail to unwrap.
 pub const PBKDF2_ITERATIONS: u32 = 210_000;
+
 pub const SALT_LEN: usize = 16;
 pub const NONCE_LEN: usize = 12;
 pub const KEY_LEN: usize = 32;
+
+/// Field-level envelope version. The claim page must validate this prefix
+/// and reject any other value.
 const FIELD_VERSION: &str = "v1";
 
 /// Cryptographically secure random bytes (OS CSPRNG).
@@ -54,7 +90,7 @@ pub fn derive_key(
 pub fn encrypt(key: &[u8; KEY_LEN], plaintext: &[u8]) -> Result<(Vec<u8>, [u8; NONCE_LEN]), AppError> {
     let cipher = Aes256Gcm::new_from_slice(key)
         .map_err(|e| AppError::Crypto(format!("invalid key: {e}")))?;
-    let nonce = Aes256Gcm::generate_nonce(&mut OsRng); // fresh random nonce every call
+    let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
     let ciphertext = cipher
         .encrypt(&nonce, plaintext)
         .map_err(|e| AppError::Crypto(format!("encryption failed: {e}")))?;
@@ -97,7 +133,18 @@ pub fn b64_decode(data: &str) -> Result<Vec<u8>, AppError> {
 }
 
 /// Serializes ciphertext + nonce into one versioned string: `v1:<nonce>:<ct>`.
-/// Used for field-level encryption of sensitive DB columns.
+///
+/// Used for field-level encryption of sensitive DB columns — including the
+/// password-wrapped DEK stored in `claim_pw_wrapped_dek`.
+///
+/// # Format contract (do not change without updating the claim page)
+///
+/// ```text
+/// "<FIELD_VERSION>:<base64(nonce[12])>:<base64(ciphertext_with_auth_tag)>"
+/// ```
+///
+/// The plaintext fed into this function is UTF-8 text. For password-wrapped
+/// DEKs, the plaintext is the **hex-encoded 32-byte DEK** (64 hex chars).
 pub fn encrypt_to_field(key: &[u8; KEY_LEN], plaintext: &str) -> Result<String, AppError> {
     let (ct, nonce) = encrypt(key, plaintext.as_bytes())?;
     Ok(format!("{FIELD_VERSION}:{}:{}", b64_encode(&nonce), b64_encode(&ct)))

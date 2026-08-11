@@ -96,16 +96,33 @@ export const api = {
     invoke<SmsStatus>("get_sms_status", { sessionToken }),
 
   // --- Phase 1: Trust & Compliance ---
-  
   deleteAccount: (sessionToken: string, confirmation: string) =>
     invoke<void>("delete_account", { sessionToken, confirmation }),
 
   getAuditLogs: (sessionToken: string) =>
     invoke<any[]>("get_audit_logs", { sessionToken }),
 
-    // --- Phase 15: Immutable Credit Ledger ---
+  // --- Phase 15: Immutable Credit Ledger ---
   getCreditLedger: (sessionToken: string) =>
     invoke<any[]>("get_credit_ledger", { sessionToken }),
+
+  // --- Phase 16: Voice Recording → SMS Link ---
+  scheduleVoiceDelivery: (
+    sessionToken: string,
+    fileKey: string,
+    recipientPhone: string,
+    recipientName: string,
+    scheduledFor: string,
+    senderName: string | null
+  ) =>
+    invoke<Delivery>("schedule_voice_delivery", {
+      sessionToken,
+      fileKey,
+      recipientPhone,
+      recipientName,
+      scheduledFor,
+      senderName,
+    }),
 };
 
 export function errorMessage(e: unknown): string {
@@ -116,5 +133,4 @@ export function errorMessage(e: unknown): string {
   } catch {
     return "Unexpected error";
   }
-    
 }

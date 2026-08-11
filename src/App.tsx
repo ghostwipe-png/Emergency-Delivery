@@ -1,21 +1,21 @@
 import React, { Suspense, lazy, useState, useEffect } from 'react';
 import { useAppContext } from './context/AppContext';
 import AuthScreen from './components/AuthScreen';
-import TosConsent from './components/TosConsent'; // Phase 1 Component
+import TosConsent from './components/TosConsent';
 import Dashboard from './components/Dashboard';
 import NewDelivery from './components/NewDelivery';
 import Settings from './components/Settings';
-import CommandPalette from './components/CommandPalette'; // Phase 7 Component
+import CommandPalette from './components/CommandPalette';
 import ChatView from './components/ChatView';
-import SocialView from './features/social/SocialView'; // Phase 9: Social Layer
-import { useNotifications } from './hooks/useNotifications'; // Phase 5 Hook
+import SocialView from './features/social/SocialView';
+import { useNotifications } from './hooks/useNotifications';
 import StatusView from './features/social/StatusView';
 import { useUpdater } from './hooks/useUpdater';
 
 const Analytics = lazy(() => import('./components/Analytics'));
 
-// Added 'social' and 'status' to the View type
-type View = 'dashboard' | 'new' | 'analytics' | 'settings' | 'chat' |  'social' | 'status';
+// View type keeps all routes available for future re-enablement
+type View = 'dashboard' | 'new' | 'analytics' | 'settings' | 'chat' | 'social' | 'status';
 
 const CURRENT_TOS_VERSION = 1;
 
@@ -23,20 +23,15 @@ const App: React.FC = () => {
   const { user, ready, pending, logout, refreshUser } = useAppContext();
   const [currentView, setCurrentView] = useState<View>('dashboard');
   
-  // Phase 7: Command Palette State
   const [isPaletteOpen, setIsPaletteOpen] = useState(false);
 
-  // Phase 5: Initialize background notification polling (Strictly Additive)
-  // Placed before early returns to strictly follow the Rules of Hooks.
   useNotifications();
-
   useUpdater();
 
-  // Phase 7: Global Command Palette Shortcut (Ctrl+K / Cmd+K)
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
-        e.preventDefault(); // Prevent browser's default focus search
+        e.preventDefault();
         setIsPaletteOpen((prev) => !prev);
       }
     };
@@ -44,7 +39,6 @@ const App: React.FC = () => {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, []);
 
-  // 1. Loading State
   if (!ready) {
     return (
       <div className="flex items-center justify-center h-screen bg-[#0b141a] text-[#e9edef]">
@@ -53,18 +47,15 @@ const App: React.FC = () => {
     );
   }
 
-  // 2. Authentication Gate
   if (!user || pending) {
     return <AuthScreen />;
   }
 
-  // 3. Phase 1: ToS Consent Gate (Blocks Dashboard until accepted)
   const userTosVersion = (user as any)?.tos_version ?? 0;
   if (userTosVersion < CURRENT_TOS_VERSION) {
     return <TosConsent onAccepted={refreshUser} />;
   }
 
-  // 4. View Router
   const renderView = () => {
     switch (currentView) {
       case 'dashboard':
@@ -88,12 +79,10 @@ const App: React.FC = () => {
     }
   };
 
-  // Safe property access to prevent TS errors if User interface is loosely typed
   const userEmail = user?.email || 'User';
   const userCredits = (user as any)?.credits ?? (user as any)?.delivery_credits ?? 0;
   const userSmsBalance = (user as any)?.sms_balance ?? (user as any)?.smsBalance ?? 0;
 
-  // 5. Authenticated Layout
   return (
     <div className="flex h-screen bg-[#0b141a] text-[#e9edef] overflow-hidden fade-in">
       
@@ -106,7 +95,7 @@ const App: React.FC = () => {
           <p className="text-sm text-[#8696a0] mt-1">Secure • Reliable • Timely</p>
         </div>
 
-        {/* Navigation */}
+        {/* Navigation — Core Delivery Operations Only */}
         <nav className="flex-1 space-y-1">
           <button
             onClick={() => setCurrentView('dashboard')}
@@ -138,6 +127,13 @@ const App: React.FC = () => {
             <span className="font-medium">Analytics</span>
           </button>
 
+          {/* ============================================================
+             FUTURE FEATURES — Commented out for focused MVP launch.
+             These features are fully built and ready to re-enable
+             whenever users request them. Simply uncomment the blocks below.
+             ============================================================ */}
+
+          {/* [SECURE CHAT — FUTURE]
           <button
             onClick={() => setCurrentView('chat')}
             className={`nav-item w-full text-left px-4 py-3 rounded-xl flex items-center space-x-3 transition-colors ${
@@ -147,8 +143,9 @@ const App: React.FC = () => {
             <span className="text-xl">💬</span>
             <span className="font-medium">Secure Chat</span>
           </button>
+          */}
 
-          {/* Phase 9: Standalone Social Layer */}
+          {/* [SOCIAL LAYER — FUTURE]
           <button
             onClick={() => setCurrentView('social')}
             className={`nav-item w-full text-left px-4 py-3 rounded-xl flex items-center space-x-3 transition-colors ${
@@ -158,7 +155,9 @@ const App: React.FC = () => {
             <span className="text-xl">🌐</span>
             <span className="font-medium">Social</span>
           </button>
-          {/* Phase 11: Status/Stories */}
+          */}
+
+          {/* [STATUS / STORIES — FUTURE]
           <button
             onClick={() => setCurrentView('status')}
             className={`nav-item w-full text-left px-4 py-3 rounded-xl flex items-center space-x-3 transition-colors ${
@@ -168,6 +167,11 @@ const App: React.FC = () => {
             <span className="text-xl">⏱️</span>
             <span className="font-medium">Status</span>
           </button>
+          */}
+
+          {/* ============================================================
+             END OF FUTURE FEATURES
+             ============================================================ */}
 
           <button
             onClick={() => setCurrentView('settings')}
@@ -185,7 +189,7 @@ const App: React.FC = () => {
           <div className="px-2 mb-4">
             <p className="text-xs uppercase tracking-wider text-[#8696a0] mb-1">Logged in as</p>
             <p className="font-medium text-[#e9edef] truncate" title={userEmail}>{userEmail}</p>
-                        <div className="flex gap-3 mt-2 text-xs font-semibold">
+            <div className="flex gap-3 mt-2 text-xs font-semibold">
               <span className="text-[#00a884] flex items-center gap-1" title="Email Credits">
                 ✉️ <span>{userCredits}</span>
               </span>
@@ -210,7 +214,6 @@ const App: React.FC = () => {
         </div>
       </main>
 
-      {/* Phase 7: Global Command Palette (Strictly Additive) */}
       <CommandPalette isOpen={isPaletteOpen} onClose={() => setIsPaletteOpen(false)} />
     </div>
   );

@@ -1,11 +1,12 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { LazyStore } from '@tauri-apps/plugin-store';
 import { useAppContext } from '../context/AppContext';
+import { api } from '../services/api';
 import PaymentModal from './PaymentModal';
 import { Delivery } from '../types';
 
-type MainTab = 'email' | 'sms';
+type MainTab = 'email' | 'sms' | 'voice'; // Phase 16: Added 'voice'
 type EmailContentTab = 'file' | 'typed';
 type Preset = 'now' | '1h' | '24h' | '1w' | '1m' | 'custom';
 type LinkExpiry = 'none' | '24h' | '168h';
@@ -57,7 +58,6 @@ const LINK_VIEW_OPTIONS: { value: LinkViews; label: string }[] = [
   { value: '10', label: '10 views max' },
 ];
 
-// Phase 3: Recurring Deliveries Options (Strictly Additive)
 const RECURRENCE_OPTIONS: { value: 'none' | 'daily' | 'weekly' | 'monthly'; label: string }[] = [
   { value: 'none', label: 'Send once (No recurrence)' },
   { value: 'daily', label: 'Repeat Daily' },
@@ -128,10 +128,10 @@ const NewDelivery: React.FC<NewDeliveryProps> = ({ onDone }) => {
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [loadingPreview, setLoadingPreview] = useState(false);
 
-  // Phase 3: Recurring Deliveries State (Strictly Additive)
+  // Phase 3: Recurring Deliveries State
   const [recurrence, setRecurrence] = useState<'none' | 'daily' | 'weekly' | 'monthly'>('none');
 
-  // Phase 4: Emergency Delivery State (Strictly Additive)
+  // Phase 4: Emergency Delivery State
   const [isEmergency, setIsEmergency] = useState(false);
 
   const [preset, setPreset] = useState<Preset>('now');
@@ -144,12 +144,20 @@ const NewDelivery: React.FC<NewDeliveryProps> = ({ onDone }) => {
   const [smsStatus, setSmsStatus] = useState<SmsStatus | null>(null);
   const [loadingStatus, setLoadingStatus] = useState(false);
 
+  // Phase 16: Voice Recording State
+  const [recording, setRecording] = useState(false);
+  const [recordedBlob, setRecordedBlob] = useState<Blob | null>(null);
+  const [audioUrl, setAudioUrl] = useState<string | null>(null);
+  const [voiceRecipientName, setVoiceRecipientName] = useState('');
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const chunksRef = useRef<Blob[]>([]);
+
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
   const [showPaymentModal, setShowPaymentModal] = useState(false);
 
-  // PHASE 15: SMS Paywall Logic (Allow send if Free Tier > 0 OR Paid Credits > 0)
+  // PHASE 15: SMS Paywall Logic
   const canSendSms = (smsStatus?.freeRemaining ?? 0) > 0 || smsCredits > 0;
 
   const parsedBulkEmails = bulkMode
@@ -162,6 +170,13 @@ const NewDelivery: React.FC<NewDeliveryProps> = ({ onDone }) => {
         )
       )
     : [];
+
+  // Cleanup audio URLs on unmount to prevent memory leaks
+  useEffect(() => {
+    return () => {
+      if (audioUrl) URL.revokeObjectURL(audioUrl);
+    };
+  }, [audioUrl]);
 
   useEffect(() => {
     const loadDefaultPreset = async () => {
@@ -274,14 +289,12 @@ const NewDelivery: React.FC<NewDeliveryProps> = ({ onDone }) => {
     setPreviewUrl(null);
 
     try {
-      // Tauri serializes Rust Vec<u8> as a standard JS number array
       const bytes = await invoke<Uint8Array | number[]>('preview_file', { 
         sessionToken, 
         fileKey: fileInfo.file_key 
       });
       
       const uint8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
-      // TS 5.7+: slice() returns a fresh ArrayBuffer-backed Uint8Array, satisfying BlobPart
       const blob = new Blob([uint8.slice()], {
         type: fileInfo.file_type || 'application/octet-stream',
       });
@@ -370,7 +383,6 @@ const NewDelivery: React.FC<NewDeliveryProps> = ({ onDone }) => {
       return;
     }
 
-    // Phase 2: Validate password if protection is enabled
     if (contentTab === 'file' && enableClaimPassword && !claimPassword.trim()) {
       setError('Please enter a password or disable password protection.');
       return;
@@ -407,11 +419,8 @@ const NewDelivery: React.FC<NewDeliveryProps> = ({ onDone }) => {
       sender_email: anonymous ? '' : userEmail,
       link_expires_hours: linkExpiryHours,
       link_max_views: linkMaxViews,
-      // Phase 2: Pass the claim password to Rust
       claim_password: (contentTab === 'file' && enableClaimPassword) ? claimPassword.trim() : null,
-      // Phase 3: Pass recurrence pattern to Rust
       recurrence: recurrence === 'none' ? null : recurrence,
-      // Phase 4: Pass emergency flag to Rust
       is_emergency: isEmergency,
     };
 
@@ -428,8 +437,8 @@ const NewDelivery: React.FC<NewDeliveryProps> = ({ onDone }) => {
       setFileInfo(null);
       setEnableClaimPassword(false);
       setClaimPassword('');
-      setRecurrence('none'); // Phase 3: Reset recurrence
-      setIsEmergency(false); // Phase 4: Reset emergency flag
+      setRecurrence('none');
+      setIsEmergency(false);
       
       await refreshUser();
     } catch (err: any) {
@@ -515,6 +524,130 @@ const NewDelivery: React.FC<NewDeliveryProps> = ({ onDone }) => {
     }
   };
 
+  // ============================================================
+  // PHASE 16: Voice Recording Handlers
+  // ============================================================
+  const startRecording = async () => {
+    setError(null);
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const recorder = new MediaRecorder(stream);
+      chunksRef.current = [];
+      
+      recorder.ondataavailable = (e) => {
+        if (e.data.size > 0) chunksRef.current.push(e.data);
+      };
+      
+      recorder.onstop = () => {
+        const blob = new Blob(chunksRef.current, { type: 'audio/webm' });
+        setRecordedBlob(blob);
+        if (audioUrl) URL.revokeObjectURL(audioUrl);
+        setAudioUrl(URL.createObjectURL(blob));
+        stream.getTracks().forEach((t) => t.stop());
+      };
+      
+      mediaRecorderRef.current = recorder;
+      recorder.start();
+      setRecording(true);
+    } catch {
+      setError('Microphone access denied. Please allow microphone permissions and try again.');
+    }
+  };
+
+  const stopRecording = () => {
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+      mediaRecorderRef.current.stop();
+    }
+    setRecording(false);
+  };
+
+  const discardRecording = () => {
+    if (audioUrl) URL.revokeObjectURL(audioUrl);
+    setRecordedBlob(null);
+    setAudioUrl(null);
+    chunksRef.current = [];
+  };
+
+  const handleScheduleVoice = async () => {
+    setError(null);
+    setSuccess(null);
+    if (!sessionToken) return;
+
+    if (!recordedBlob) {
+      setError('Please record a voice message first.');
+      return;
+    }
+
+    const normalized = normalizePhone(phone);
+    if (!isValidKenyanPhone(normalized)) {
+      setError('Enter a valid Kenyan phone number, e.g. 254712345678.');
+      return;
+    }
+
+    if (!voiceRecipientName.trim()) {
+      setError('Enter the recipient name.');
+      return;
+    }
+
+    const scheduledDate = getScheduledDate();
+    if (!scheduledDate) {
+      setError('Choose a valid delivery time.');
+      return;
+    }
+
+    // PHASE 15: Check SMS credits before recording upload (voice uses SMS channel)
+    if (!canSendSms) {
+      setShowPaymentModal(true);
+      setError('Insufficient SMS credits to schedule voice delivery.');
+      return;
+    }
+
+    setLoading(true);
+    try {
+      // 1. Convert blob to bytes for secure upload
+      const arrayBuffer = await recordedBlob.arrayBuffer();
+      const bytes = new Uint8Array(arrayBuffer);
+
+      // 2. Upload encrypted recording through existing secure pipeline
+      const uploadResult = await invoke<UploadInfo>('upload_file', {
+        sessionToken,
+        fileName: `voice-${Date.now()}.webm`,
+        fileBytes: bytes,
+      });
+
+      const info = normalizeUpload(uploadResult);
+      if (!info.file_key) {
+        throw new Error('Upload failed: missing file key.');
+      }
+
+      // 3. Schedule via the new voice delivery command
+      await api.scheduleVoiceDelivery(
+        sessionToken,
+        info.file_key,
+        normalized,
+        voiceRecipientName.trim(),
+        scheduledDate.toISOString(),
+        (user as any)?.name || null
+      );
+
+      setSuccess('Voice delivery scheduled! The recipient will receive a secure SMS link at the chosen time.');
+      
+      // Cleanup state
+      discardRecording();
+      setPhone('');
+      setVoiceRecipientName('');
+      await refreshUser();
+    } catch (err: any) {
+      const message = String(err?.message || err || 'Failed to schedule voice delivery.');
+      if (/insufficient|credit|balance|payment/i.test(message)) {
+        setShowPaymentModal(true);
+      }
+      setError(message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const handlePaymentSuccess = async () => {
     setShowPaymentModal(false);
     setError(null);
@@ -566,7 +699,7 @@ const NewDelivery: React.FC<NewDeliveryProps> = ({ onDone }) => {
           </div>
         )}
 
-        {/* Main Channel Tabs */}
+        {/* Main Channel Tabs - Phase 16: Added Voice Tab */}
         <div className="flex bg-[#202c33] p-1 rounded-xl mb-6">
           <button
             onClick={() => {
@@ -580,7 +713,7 @@ const NewDelivery: React.FC<NewDeliveryProps> = ({ onDone }) => {
                 : 'text-[#8696a0] hover:text-[#e9edef]'
             }`}
           >
-            Email
+            ✉️ Email
           </button>
           <button
             onClick={() => {
@@ -594,7 +727,21 @@ const NewDelivery: React.FC<NewDeliveryProps> = ({ onDone }) => {
                 : 'text-[#8696a0] hover:text-[#e9edef]'
             }`}
           >
-            SMS
+            📱 SMS
+          </button>
+          <button
+            onClick={() => {
+              setMainTab('voice');
+              setError(null);
+              setSuccess(null);
+            }}
+            className={`flex-1 py-2 rounded-lg font-medium transition-colors ${
+              mainTab === 'voice'
+                ? 'bg-[#2a3942] text-[#e9edef]'
+                : 'text-[#8696a0] hover:text-[#e9edef]'
+            }`}
+          >
+            🎙️ Voice
           </button>
         </div>
 
@@ -665,7 +812,6 @@ const NewDelivery: React.FC<NewDeliveryProps> = ({ onDone }) => {
                     <div className="flex items-center gap-2 shrink-0">
                       {fileInfo && (
                         <>
-                          {/* Phase 2: Secure Preview Button */}
                           <button
                             onClick={() => void handlePreviewFile()}
                             className="btn-ghost px-3 py-2 rounded-lg bg-[#111b21] text-[#00a884] hover:text-[#06cf9c] transition-colors text-sm font-medium"
@@ -691,7 +837,6 @@ const NewDelivery: React.FC<NewDeliveryProps> = ({ onDone }) => {
                   </div>
                 </div>
 
-                {/* Phase 2: Password Protection UI */}
                 {contentTab === 'file' && fileInfo && (
                   <div className="panel-2 bg-[#202c33] rounded-xl p-4 space-y-3 fade-in">
                     <label className="flex items-center space-x-3 cursor-pointer select-none">
@@ -727,7 +872,6 @@ const NewDelivery: React.FC<NewDeliveryProps> = ({ onDone }) => {
               </div>
             )}
 
-            {/* Recipient Controls */}
             <div>
               <div className="flex items-center justify-between mb-2">
                 <label className="label text-sm text-[#8696a0]">
@@ -765,7 +909,6 @@ const NewDelivery: React.FC<NewDeliveryProps> = ({ onDone }) => {
               )}
             </div>
 
-            {/* Sender Identity */}
             <div className="panel-2 bg-[#202c33] rounded-xl p-4">
               <label className="flex items-start space-x-3 cursor-pointer select-none">
                 <input
@@ -783,7 +926,6 @@ const NewDelivery: React.FC<NewDeliveryProps> = ({ onDone }) => {
               </label>
             </div>
 
-            {/* Delivery Time */}
             <div>
               <label className="label block text-sm text-[#8696a0] mb-2">
                 Delivery time
@@ -815,7 +957,6 @@ const NewDelivery: React.FC<NewDeliveryProps> = ({ onDone }) => {
               )}
             </div>
 
-            {/* Link Controls */}
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               <div>
                 <label className="label block text-sm text-[#8696a0] mb-2">
@@ -852,7 +993,6 @@ const NewDelivery: React.FC<NewDeliveryProps> = ({ onDone }) => {
               </div>
             </div>
 
-            {/* Phase 3: Recurring Delivery Controls (Strictly Additive) */}
             <div>
               <label className="label block text-sm text-[#8696a0] mb-2">
                 Recurring delivery
@@ -875,7 +1015,6 @@ const NewDelivery: React.FC<NewDeliveryProps> = ({ onDone }) => {
               )}
             </div>
 
-            {/* Phase 4: Emergency Delivery Toggle (Strictly Additive) */}
             <div className="panel-2 bg-[#202c33] rounded-xl p-4 border border-red-900/30">
               <label className="flex items-start space-x-3 cursor-pointer select-none">
                 <input
@@ -893,7 +1032,6 @@ const NewDelivery: React.FC<NewDeliveryProps> = ({ onDone }) => {
               </label>
             </div>
 
-            {/* Phase 15: Email Paywall Warning */}
             {emailCredits <= 0 && (
               <p className="text-red-400 text-xs text-center mb-2 animate-pulse font-medium">
                 ⚠️ You have 0 Email credits. Please upgrade to send.
@@ -914,7 +1052,7 @@ const NewDelivery: React.FC<NewDeliveryProps> = ({ onDone }) => {
                 : 'Schedule Delivery'}
             </button>
           </div>
-        ) : (
+        ) : mainTab === 'sms' ? (
           <div className="space-y-6">
             <div>
               <label className="label block text-sm text-[#8696a0] mb-2">
@@ -980,7 +1118,6 @@ const NewDelivery: React.FC<NewDeliveryProps> = ({ onDone }) => {
               )}
             </div>
 
-            {/* Phase 15: SMS Paywall Warning */}
             {!canSendSms && !loadingStatus && (
               <p className="text-red-400 text-xs text-center mb-2 animate-pulse font-medium">
                 ⚠️ You have 0 SMS credits. Please upgrade to send.
@@ -1006,6 +1143,183 @@ const NewDelivery: React.FC<NewDeliveryProps> = ({ onDone }) => {
 
             <p className="text-xs text-[#8696a0] text-center">
               SMS delivery is Kenya-only and sent immediately. SMS is never retried automatically to prevent duplicates.
+            </p>
+          </div>
+        ) : (
+          // ============================================================
+          // PHASE 16: VOICE RECORDING TAB
+          // ============================================================
+          <div className="space-y-6">
+            {/* Voice Recorder */}
+            <div className="panel-2 bg-[#202c33] rounded-xl p-6 text-center space-y-4">
+              <h3 className="text-lg font-bold text-[#e9edef]">Record Voice Message</h3>
+              
+              <div className="flex items-center justify-center gap-4">
+                {!recording && !audioUrl && (
+                  <button 
+                    onClick={() => void startRecording()} 
+                    className="w-20 h-20 mx-auto rounded-full bg-[#00a884] hover:bg-[#06cf9c] text-white text-3xl shadow-lg hover:scale-105 transition-transform"
+                    aria-label="Start recording"
+                  >
+                    🎙️
+                  </button>
+                )}
+
+                {recording && (
+                  <button 
+                    onClick={stopRecording} 
+                    className="w-20 h-20 mx-auto rounded-full bg-red-500 hover:bg-red-600 text-white text-2xl shadow-lg animate-pulse"
+                    aria-label="Stop recording"
+                  >
+                    ■
+                  </button>
+                )}
+
+                {audioUrl && !recording && (
+                  <button 
+                    onClick={discardRecording} 
+                    className="w-20 h-20 mx-auto rounded-full bg-red-500 hover:bg-red-600 text-white text-xl shadow-lg"
+                    aria-label="Discard recording"
+                  >
+                    🗑️
+                  </button>
+                )}
+              </div>
+
+              <p className="text-sm text-[#8696a0]">
+                {recording 
+                  ? '🔴 Recording... Tap stop when finished' 
+                  : audioUrl 
+                  ? 'Recording ready. Tap play to preview or trash to discard.' 
+                  : 'Tap microphone to start recording'}
+              </p>
+
+              {audioUrl && !recording && (
+                <audio controls src={audioUrl} className="w-full mt-4 rounded-lg" />
+              )}
+
+              {recordedBlob && (
+                <p className="text-xs text-[#8696a0]">
+                  Size: {formatBytes(recordedBlob.size)}
+                </p>
+              )}
+            </div>
+
+            {/* Recipient Name */}
+            <div>
+              <label className="label block text-sm text-[#8696a0] mb-2">
+                Recipient name
+              </label>
+              <input
+                value={voiceRecipientName}
+                onChange={(e) => setVoiceRecipientName(e.target.value)}
+                className="input w-full bg-[#202c33] text-[#e9edef] p-3 rounded-xl outline-none focus:ring-2 focus:ring-[#00a884]"
+                placeholder="e.g. Jane Doe"
+              />
+            </div>
+
+            {/* Kenyan Phone Number */}
+            <div>
+              <label className="label block text-sm text-[#8696a0] mb-2">
+                Kenyan phone number
+              </label>
+              <input
+                type="tel"
+                value={phone}
+                onChange={(e) => setPhone(e.target.value)}
+                className="input w-full bg-[#202c33] text-[#e9edef] p-3 rounded-xl outline-none focus:ring-2 focus:ring-[#00a884]"
+                placeholder="+254712345678"
+              />
+            </div>
+
+            {/* Delivery Time Presets */}
+            <div>
+              <label className="label block text-sm text-[#8696a0] mb-2">
+                Delivery time
+              </label>
+              <div className="flex flex-wrap gap-2">
+                {PRESETS.map((item) => (
+                  <button
+                    key={item.value}
+                    onClick={() => selectPreset(item.value)}
+                    className={`px-4 py-2 rounded-xl text-sm font-medium transition-colors ${
+                      preset === item.value 
+                        ? 'bg-[#00a884] text-white' 
+                        : 'bg-[#202c33] text-[#8696a0] hover:bg-[#2a3942]'
+                    }`}
+                  >
+                    {item.label}
+                  </button>
+                ))}
+              </div>
+              {preset === 'custom' && (
+                <input
+                  type="datetime-local"
+                  value={customDate}
+                  min={toLocalInput(new Date())}
+                  onChange={(e) => setCustomDate(e.target.value)}
+                  className="input w-full bg-[#202c33] text-[#e9edef] p-3 rounded-xl outline-none focus:ring-2 focus:ring-[#00a884] mt-3"
+                />
+              )}
+            </div>
+
+            {/* SMS Credit Status */}
+            <div className="panel-2 bg-[#202c33] rounded-xl p-4 text-sm">
+              {smsStatus ? (
+                smsStatus.freeRemaining > 0 ? (
+                  <p className="text-[#e9edef]">
+                    Free SMS remaining:{' '}
+                    <span className="text-[#00a884] font-bold">{smsStatus.freeRemaining}</span>
+                    {' '}(Voice delivery uses 1 SMS credit)
+                  </p>
+                ) : smsStatus.credits > 0 ? (
+                  <p className="text-[#e9edef]">
+                    Paid SMS credits:{' '}
+                    <span className="text-[#00a884] font-bold">{smsStatus.credits}</span>
+                    {' '}(Voice delivery uses 1 SMS credit)
+                  </p>
+                ) : (
+                  <div className="flex items-center justify-between gap-4">
+                    <p className="text-red-400">No SMS credits remaining.</p>
+                    <button
+                      onClick={() => setShowPaymentModal(true)}
+                      className="btn-secondary bg-[#2a3942] hover:bg-[#00a884] px-3 py-1.5 rounded-lg text-xs font-medium transition-colors"
+                    >
+                      Buy Credits
+                    </button>
+                  </div>
+                )
+              ) : (
+                <p className="text-[#8696a0]">Unable to load SMS status.</p>
+              )}
+            </div>
+
+            {/* Paywall Warning */}
+            {!canSendSms && (
+              <p className="text-red-400 text-xs text-center mb-2 animate-pulse font-medium">
+                ⚠️ You have 0 SMS credits. Voice delivery requires 1 SMS credit.
+              </p>
+            )}
+
+            {/* Schedule Button */}
+            <button
+              onClick={() => void handleScheduleVoice()}
+              disabled={loading || recording || !recordedBlob || !canSendSms}
+              className="btn-primary w-full bg-[#00a884] hover:bg-[#06cf9c] text-white font-bold py-3 rounded-xl transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {loading 
+                ? 'Scheduling...' 
+                : !recordedBlob
+                ? 'Record a message first'
+                : !canSendSms
+                ? 'Out of SMS Credits'
+                : preset === 'now'
+                ? 'Send Voice Now (1 SMS)'
+                : 'Schedule Voice Delivery (1 SMS)'}
+            </button>
+
+            <p className="text-xs text-[#8696a0] text-center">
+              🔐 Your voice is encrypted before upload. The recipient receives a secure SMS link to listen.
             </p>
           </div>
         )}

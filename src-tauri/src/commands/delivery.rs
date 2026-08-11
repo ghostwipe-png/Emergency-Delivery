@@ -557,3 +557,80 @@ pub async fn global_search(
 
     Ok(results)
 }
+
+// ------------------------------------------------------------- Phase 16: Voice Recording → SMS Link
+
+// ------------------------------------------------------------- Phase 16: Voice Recording → SMS Link
+
+#[tauri::command]
+pub async fn schedule_voice_delivery(
+    state: State<'_, AppState>,
+    session_token: String,
+    file_key: String,
+    recipient_phone: String,
+    recipient_name: String,
+    scheduled_for: chrono::DateTime<Utc>, // FIX 1: Added chrono:: prefix
+    sender_name: Option<String>,
+) -> Result<Delivery, AppError> {
+    let user = require_session(&state, &session_token).await?;
+    let kek = state.current_kek()?;
+
+    // Validate the uploaded audio
+    let key = utils::validate_file_key(&file_key)?;
+    let upload = db::get_upload(&state.db, &key, &user.id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("uploaded recording not found".into()))?;
+    if upload.used {
+        return Err(AppError::Validation("this recording has already been scheduled".into()));
+    }
+
+    let phone = utils::validate_kenyan_phone(&recipient_phone)?;
+    let scheduled_for = utils::validate_schedule_time(scheduled_for)?;
+    let recipient_name = utils::validate_display_name(&recipient_name, "recipient name")?;
+
+    // PHASE 15: Deduct 1 SMS credit (the link is delivered via SMS)
+    db::deduct_credit(&state.db, &user.id, 0, 1, "voice_delivery").await?;
+
+    let rec = DeliveryRecord {
+        id: Uuid::new_v4().to_string(),
+        user_id: user.id.clone(),
+        content_type: "file".into(),
+        channel: "sms".into(),
+        file_name: Some(upload.file_name.clone()), // FIX 2: Wrapped in Some()
+        file_size: upload.file_size,
+        file_type: Some(upload.file_type.clone()), // FIX 3: Wrapped in Some()
+        file_key: Some(key),
+        wrapped_dek: upload.wrapped_dek.clone(),
+        dek_nonce: upload.dek_nonce.clone(),
+        message_text: None,
+        recipient_name,
+        recipient_email: None,
+        recipient_phone: Some(crypto::encrypt_to_field(&kek, &phone)?),
+        sender_mode: "identified".into(),
+        sender_name: sender_name.as_deref().map(|s| crypto::encrypt_to_field(&kek, s)).transpose()?,
+        sender_email: None,
+        scheduled_for,
+        status: DeliveryStatus::Pending.as_str().into(),
+        delivery_token: crypto::secure_token(),
+        created_at: Utc::now(),
+        delivered_at: None,
+        link_expires_at: None,
+        link_max_views: None,
+        claim_password_hash: None,
+        claim_password_salt: None,
+        claim_pw_wrapped_dek: None,
+        recurrence: None,
+        worker_registered: 1, // Dispatched locally via SMS, no worker queue needed
+        worker_payload_enc: None,
+        is_emergency: 0,
+    };
+
+    // Refund the SMS credit if the DB insert fails
+    if let Err(err) = db::create_delivery(&state.db, &rec).await {
+        let _ = db::deduct_credit(&state.db, &user.id, 0, -1, "voice_delivery_refund").await;
+        return Err(err);
+    }
+
+    tracing::info!(delivery_id = %rec.id, "voice delivery scheduled");
+    Delivery::from_record(&rec, &kek)
+}

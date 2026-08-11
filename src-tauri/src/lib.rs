@@ -252,6 +252,37 @@ fn spawn_scheduler(app: &tauri::AppHandle, pool: db::DbPool, shutdown: Arc<Atomi
             match db::due_deliveries(&pool, Utc::now()).await {
                 Ok(records) => {
                     for record in records {
+
+                        // ---- Phase 16: Voice → SMS Link Dispatch ----
+                        if record.channel == "sms" && record.file_key.is_some() {
+                            if let Some(state) = handle.try_state::<AppState>() {
+                                if let (Some(mobitech), Some(worker_url)) = (&state.mobitech, &state.worker_url) {
+                                    if let Ok(kek) = state.current_kek() {
+                                        let phone_plain = record.recipient_phone.as_deref()
+                                            .and_then(|p| crypto::decrypt_field(&kek, p).ok())
+                                            .unwrap_or_default();
+                                        let claim_url = format!(
+                                            "{}/claim/{}",
+                                            worker_url.trim_end_matches('/'),
+                                            record.delivery_token
+                                        );
+                                        let sms_text = format!("🎙️ You have a voice message. Listen securely: {}", claim_url);
+
+                                        match mobitech.send_sms(&phone_plain, &sms_text).await {
+                                            Ok(_) => {
+                                                let _ = db::mark_delivered(&pool, &record.id).await;
+                                                let _ = handle.emit("delivery-updated", record.id.clone());
+                                            }
+                                            Err(err) => {
+                                                tracing::warn!(delivery_id = %record.id, error = %err, "voice SMS failed; will retry");
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            continue; // Skip the email path
+                        }
+
                         match db::mark_delivered(&pool, &record.id).await {
                             Ok(true) => {
                                 tracing::info!(delivery_id = %record.id, "delivery dispatched");
@@ -403,6 +434,7 @@ pub fn run() {
             commands::social::social_search_user,
             commands::social::social_add_contact,
             commands::social::social_list_contacts,
+            commands::delivery::schedule_voice_delivery, // <-- Phase 16
         ])
         .on_window_event(|window, event| match event {
             tauri::WindowEvent::CloseRequested { api, .. } => {
