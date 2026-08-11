@@ -185,9 +185,13 @@ const App: React.FC = () => {
           <div className="px-2 mb-4">
             <p className="text-xs uppercase tracking-wider text-[#8696a0] mb-1">Logged in as</p>
             <p className="font-medium text-[#e9edef] truncate" title={userEmail}>{userEmail}</p>
-            <div className="flex gap-3 mt-2 text-xs font-semibold">
-              <span className="text-[#00a884]">Credits: {userCredits}</span>
-              <span className="text-[#53bdeb]">SMS: {userSmsBalance}</span>
+                        <div className="flex gap-3 mt-2 text-xs font-semibold">
+              <span className="text-[#00a884] flex items-center gap-1" title="Email Credits">
+                ✉️ <span>{userCredits}</span>
+              </span>
+              <span className="text-[#53bdeb] flex items-center gap-1" title="SMS Credits">
+                📱 <span>{userSmsBalance}</span>
+              </span>
             </div>
           </div>
           <button

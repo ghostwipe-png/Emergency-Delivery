@@ -76,8 +76,6 @@ struct EnvConfig {
     mobitech_api_url: Option<String>,
 }
 
-
-
 fn load_env_config() -> EnvConfig {
     // option_env! reads the variables AT COMPILE TIME and bakes them into the binary.
     // Your users will never need a .env file!
@@ -177,7 +175,8 @@ async fn initialize(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::Er
 
     let db_path = data_dir.join("secure").join("deliveries.db");
     let pool = db::init_pool(&db_path).await?;
-    // Add this after db::init_pool
+    
+    // Phase 9: Social Tables
     let _ = crate::services::social::init_social_tables(&pool).await;
     tracing::info!("database ready");
 
@@ -344,7 +343,6 @@ pub fn run() {
     let ctx = tauri::generate_context!();
 
     tauri::Builder::default()
-        
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_store::Builder::new().build())
         .plugin(tauri_plugin_notification::init())
@@ -372,6 +370,7 @@ pub fn run() {
             commands::payment::get_payment_plans,
             commands::payment::initialize_payment,
             commands::payment::verify_payment,
+            commands::payment::get_credit_ledger, // <-- ADDED FOR PHASE 15 AUDIT TRAIL
             commands::delivery::schedule_delivery,
             commands::delivery::get_deliveries,
             commands::delivery::cancel_delivery,
@@ -389,10 +388,10 @@ pub fn run() {
             commands::auth::manual_heartbeat,
             commands::auth::enable_biometric_unlock,
             commands::auth::login_with_biometrics,
-            commands::auth::export_vault, // <-- ADDED FOR PHASE 7
-            commands::auth::import_vault, // <-- ADDED FOR PHASE 7 
-            commands::chat::join_chat_channel,   // <-- ADDED FOR PHASE 8
-            commands::chat::send_chat_message,   // <-- ADDED FOR PHASE 8
+            commands::auth::export_vault, 
+            commands::auth::import_vault, 
+            commands::chat::join_chat_channel,   
+            commands::chat::send_chat_message,   
             commands::chat::create_chat_channel,
             commands::chat::get_chat_channels,
             commands::chat::get_chat_messages,

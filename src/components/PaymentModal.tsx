@@ -39,6 +39,10 @@ export default function PaymentModal({
   const [phase, setPhase] = useState<Phase>('select');
   const [reference, setReference] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
+  
+  // PHASE 15: Track split credits added for the success screen
+  const [addedCredits, setAddedCredits] = useState<{ emails: number; sms: number } | null>(null);
+  
   const pollRef = useRef<number | null>(null);
 
   const isVisible = Boolean(open || isOpen || show || visible);
@@ -56,6 +60,7 @@ export default function PaymentModal({
     setSelected(null);
     setMessage(null);
     setReference(null);
+    setAddedCredits(null); // Reset Phase 15 state
     onClose();
     onCancel?.();
   }, [stopPolling, onClose, onCancel]);
@@ -66,6 +71,7 @@ export default function PaymentModal({
     setPhase('select');
     setMessage(null);
     setReference(null);
+    setAddedCredits(null);
     
     api
       .getPaymentPlans()
@@ -86,12 +92,19 @@ export default function PaymentModal({
       if (isVerified) {
         stopPolling();
         setPhase('success');
+        
+        // PHASE 15: Capture the exact split credits added
+        setAddedCredits({ 
+          emails: result?.emails_added || 0, 
+          sms: result?.sms_added || 0 
+        });
+        
         setMessage(result?.message || 'Payment verified successfully! Credits added.');
         await refreshUser();
         setTimeout(() => {
           onSuccess?.();
           handleClose();
-        }, 1500); // Brief delay to show success state
+        }, 2500); // Slightly longer delay so they can see the split credits
       } else {
         setMessage("Payment not completed yet. Please finish the payment in your browser.");
       }
@@ -120,6 +133,7 @@ export default function PaymentModal({
     setMessage(null);
     
     try {
+      // Note: Ensure your api.ts passes { plan_id: selected } if the backend expects an object
       const res: any = await api.initializePayment(sessionToken, selected);
       const authUrl = res?.authorization_url || res?.authorizationUrl || res?.url;
       const ref = res?.reference || res?.ref || res?.id;
@@ -144,11 +158,11 @@ export default function PaymentModal({
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm p-4 fade-in">
-      <div className="bg-[#111b21] w-full max-w-lg rounded-2xl p-6 shadow-2xl border border-[#202c33] relative">
+      <div className="bg-[#111b21] w-full max-w-lg rounded-2xl p-6 shadow-2xl border border-[#202c33] relative max-h-[90vh] overflow-y-auto">
         
         {/* Close Button */}
         <button
-          className="absolute top-4 right-4 w-8 h-8 flex items-center justify-center rounded-full bg-[#202c33] text-[#8696a0] hover:text-[#e9edef] hover:bg-[#2a3942] transition-colors text-sm"
+          className="absolute top-4 right-4 w-8 h-8 flex items-center justify-center rounded-full bg-[#202c33] text-[#8696a0] hover:text-[#e9edef] hover:bg-[#2a3942] transition-colors text-sm z-10"
           onClick={handleClose}
           aria-label="Close modal"
         >
@@ -168,7 +182,9 @@ export default function PaymentModal({
               {plans.map((plan: any) => {
                 const planId = String(plan.id);
                 const isSelected = selected === planId;
-                const price = plan.price ?? plan.amount_kes ?? 0;
+                
+                // PHASE 15: price_in_kobo is in cents. Divide by 100 to show actual KES.
+                const priceKES = (plan.price_in_kobo ?? 0) / 100;
                 
                 return (
                   <label
@@ -186,14 +202,28 @@ export default function PaymentModal({
                       checked={isSelected}
                       onChange={() => setSelected(planId)}
                     />
-                    <div>
-                      <p className="text-sm font-bold text-[#e9edef]">{plan.name}</p>
-                      <p className="text-xs text-[#8696a0] mt-0.5">
-                        {plan.deliveries ?? plan.amount} deliveries · email + SMS
+                    <div className="flex-1">
+                      <div className="flex items-center gap-2">
+                        <p className="text-sm font-bold text-[#e9edef]">{plan.name}</p>
+                        {plan.is_subscription && (
+                          <span className="px-1.5 py-0.5 bg-[#00a884]/20 text-[#00a884] text-[9px] font-bold rounded uppercase tracking-wider">
+                            Monthly
+                          </span>
+                        )}
+                      </div>
+                      <p className="text-xs text-[#8696a0] mt-1 flex items-center gap-3">
+                        <span className="flex items-center gap-1">
+                          <span className="text-[#00a884]">✉️</span> 
+                          {plan.emails?.toLocaleString()} Emails
+                        </span>
+                        <span className="flex items-center gap-1">
+                          <span className="text-[#53bdeb]">📱</span> 
+                          {plan.sms?.toLocaleString()} SMS
+                        </span>
                       </p>
                     </div>
-                    <p className="text-base font-bold text-[#00a884]">
-                      KSh {Number(price).toLocaleString()}
+                    <p className="text-base font-bold text-[#00a884] ml-4 whitespace-nowrap">
+                      KES {priceKES.toLocaleString()}
                     </p>
                   </label>
                 );
@@ -256,7 +286,16 @@ export default function PaymentModal({
             </div>
             <div>
               <h3 className="text-lg font-bold text-[#e9edef]">Payment Successful!</h3>
-              <p className="text-sm text-[#00a884] mt-2">{message || 'Your credits have been added.'}</p>
+              
+              {/* PHASE 15: Show exact split credits added */}
+              {addedCredits && (
+                <div className="flex justify-center gap-4 mt-3 text-sm font-bold bg-[#202c33] py-2 px-4 rounded-lg inline-flex">
+                  <span className="text-[#00a884]">+{addedCredits.emails.toLocaleString()} ✉️</span>
+                  <span className="text-[#53bdeb]">+{addedCredits.sms.toLocaleString()} 📱</span>
+                </div>
+              )}
+              
+              <p className="text-xs text-[#8696a0] mt-3">{message || 'Your credits have been added.'}</p>
             </div>
           </div>
         )}

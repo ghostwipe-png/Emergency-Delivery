@@ -1,4 +1,5 @@
-//! Paystack payments (KES). Idempotent verification with amount cross-check.
+//! Paystack payments (KES). Idempotent verification with amount & currency cross-check.
+//! PHASE 15: Added Email/SMS split, Subscriptions, and Immutable Ledger.
 
 use chrono::Utc;
 use tauri::State;
@@ -32,6 +33,7 @@ pub async fn initialize_payment(
     let plan = db::get_payment_plan(&state.db, &request.plan_id)
         .await?
         .ok_or_else(|| AppError::NotFound("payment plan not found".into()))?;
+        
     if plan.price_in_kobo <= 0 {
         return Err(AppError::Config("payment plan has an invalid price".into()));
     }
@@ -39,9 +41,7 @@ pub async fn initialize_payment(
     let reference = format!("ED-{}-{}", Utc::now().format("%Y%m%d%H%M%S"), Uuid::new_v4().as_simple());
 
     if !state.circuit.allow_request() {
-        return Err(AppError::Payment(
-            "payment service is temporarily unavailable — try again in a minute".into(),
-        ));
+        return Err(AppError::Payment("payment service is temporarily unavailable".into()));
     }
 
     let record = PaymentRecord {
@@ -53,6 +53,7 @@ pub async fn initialize_payment(
         status: "pending".into(),
         created_at: Utc::now(),
         verified_at: None,
+        redeemed_at: None, // FIX 1: Added missing Phase 15 field to prevent compile error
     };
     db::insert_payment(&state.db, &record).await?;
 
@@ -97,17 +98,20 @@ pub async fn verify_payment(
         .await?
         .ok_or_else(|| AppError::NotFound("payment not found".into()))?;
 
+    // SECURITY: User ownership check
     if payment.user_id != user.id {
         tracing::warn!(reference = %reference, "verify attempt for another user's payment");
         return Err(AppError::NotFound("payment not found".into()));
     }
 
+    // SECURITY: Anti-replay check (Fast path)
     if payment.status == "verified" {
         let plan = db::get_payment_plan(&state.db, &payment.plan_id).await?;
         return Ok(PaymentVerification {
             verified: true,
             status: "success".into(),
-            credits_added: plan.map(|p| p.deliveries).unwrap_or(0),
+            emails_added: plan.as_ref().map(|p| p.emails).unwrap_or(0),
+            sms_added: plan.as_ref().map(|p| p.sms).unwrap_or(0),
             message: "Payment already verified.".into(),
         });
     }
@@ -131,7 +135,8 @@ pub async fn verify_payment(
         return Ok(PaymentVerification {
             verified: false,
             status: verification.status,
-            credits_added: 0,
+            emails_added: 0,
+            sms_added: 0,
             message: "Payment not completed yet.".into(),
         });
     }
@@ -140,6 +145,7 @@ pub async fn verify_payment(
         .await?
         .ok_or_else(|| AppError::Internal("plan missing for payment".into()))?;
 
+    // SECURITY: Amount cross-check
     if verification.amount != payment.amount_kobo {
         tracing::error!(
             reference = %reference,
@@ -150,18 +156,68 @@ pub async fn verify_payment(
         return Err(AppError::Payment("payment amount mismatch — please contact support".into()));
     }
 
-    let newly_verified = db::mark_payment_verified(&state.db, &reference).await?;
-    let mut credits_added = 0;
-    if newly_verified {
-        db::increment_credits(&state.db, &user.id, plan.deliveries).await?;
-        credits_added = plan.deliveries;
-        tracing::info!(reference = %reference, credits = plan.deliveries, "payment verified, credits added");
+    // PHASE 15 SECURITY: Currency cross-check
+    if verification.currency != "KES" {
+        tracing::error!(reference = %reference, currency = %verification.currency, "Invalid currency");
+        return Err(AppError::Payment("Invalid payment currency".into()));
     }
+
+    // FIX 2: ATOMIC REDEMPTION (Eliminates the Double-Update Trap)
+    // We DO NOT call mark_payment_verified here. redeem_payment handles the 
+    // status update AND the credit addition in a single atomic transaction.
+    // This guarantees credits are added exactly once, even under heavy load.
+    
+        let (emails_added, sms_added) = match db::redeem_payment(
+        &state.db, 
+        &reference, 
+        &user.id, 
+        plan.emails, 
+        plan.sms, 
+        plan.is_subscription
+    ).await {
+        Ok(_) => {
+            tracing::info!(reference = %reference, emails = plan.emails, sms = plan.sms, "payment verified, credits added");
+            (plan.emails, plan.sms)
+        }
+        Err(AppError::Payment(msg)) if msg.contains("already redeemed") => {
+            // Race condition caught: another thread verified it between our check and now.
+            return Ok(PaymentVerification {
+                verified: true,
+                status: "success".into(),
+                emails_added: 0,
+                sms_added: 0,
+                message: "Payment already verified.".into(),
+            });
+        }
+        Err(e) => return Err(e),
+    };
 
     Ok(PaymentVerification {
         verified: true,
         status: "success".into(),
-        credits_added,
-        message: format!("Payment verified — {credits_added} delivery credits added."),
+        emails_added,
+        sms_added,
+        message: format!("Payment verified — {} emails and {} SMS added.", emails_added, sms_added),
     })
+}
+#[tauri::command]
+pub async fn get_credit_ledger(
+    state: State<'_, AppState>,
+    session_token: String,
+) -> Result<Vec<serde_json::Value>, AppError> {
+    let user = require_session(&state, &session_token).await?;
+    let ledger = db::get_credit_ledger(&state.db, &user.id, 50).await?;
+
+    Ok(ledger.iter().map(|(id, change_type, email_change, sms_change, balance_emails, balance_sms, reference, created_at)| {
+        serde_json::json!({
+            "id": id,
+            "type": change_type,
+            "email_change": email_change,
+            "sms_change": sms_change,
+            "balance_emails": balance_emails,
+            "balance_sms": balance_sms,
+            "reference": reference,
+            "date": created_at,
+        })
+    }).collect())
 }

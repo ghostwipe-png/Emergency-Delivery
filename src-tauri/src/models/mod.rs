@@ -116,19 +116,23 @@ impl ContentType {
     }
 }
 
+// ------------------------------------------------------------- PHASE 15: Updated User Structs
+
 #[derive(Debug, Clone, Serialize)]
 pub struct User {
     pub id: String,
     pub email: String,
     pub name: Option<String>,
     pub delivery_credits: i64,
+    pub sms_balance: i64,
     pub totp_enabled: bool,
     pub tos_version: i32,
     pub tos_accepted_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
-    // Phase 4 Additive: Dead Man's Switch
     pub heartbeat_interval_days: i32,
     pub last_heartbeat_at: Option<DateTime<Utc>>,
+    pub subscription_expires_at: Option<DateTime<Utc>>,
+    pub registration_bonus_claimed: bool,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -139,14 +143,16 @@ pub struct UserRecord {
     pub password_hash: String,
     pub password_salt: String,
     pub delivery_credits: i64,
+    pub sms_balance: i64,
     pub totp_secret: Option<String>,
     pub totp_enabled: bool,
     pub tos_version: i32,
     pub tos_accepted_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
-    // Phase 4 Additive: Dead Man's Switch
     pub heartbeat_interval_days: i32,
     pub last_heartbeat_at: Option<DateTime<Utc>>,
+    pub subscription_expires_at: Option<String>,
+    pub registration_bonus_claimed: i32,
 }
 
 impl UserRecord {
@@ -156,18 +162,20 @@ impl UserRecord {
             email: self.email.clone(),
             name: self.name.clone(),
             delivery_credits: self.delivery_credits,
+            sms_balance: self.sms_balance,
             totp_enabled: self.totp_enabled,
             tos_version: self.tos_version,
             tos_accepted_at: self.tos_accepted_at,
             created_at: self.created_at,
-            // Phase 4 Additive mappings
             heartbeat_interval_days: self.heartbeat_interval_days,
             last_heartbeat_at: self.last_heartbeat_at,
+            subscription_expires_at: self.subscription_expires_at.as_ref().and_then(|s| DateTime::parse_from_rfc3339(s).ok()).map(|d| d.with_timezone(&Utc)),
+            registration_bonus_claimed: self.registration_bonus_claimed != 0,
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Serialize)]
 pub struct AuthResponse {
     pub token: String,
     pub user: User,
@@ -244,7 +252,6 @@ pub struct DeliveryRecord {
     pub recurrence: Option<String>,
     pub worker_registered: i32,
     pub worker_payload_enc: Option<String>,
-    // Phase 4 Additive: Dead Man's Switch
     pub is_emergency: i32,
 }
 
@@ -271,7 +278,6 @@ pub struct Delivery {
     pub link_max_views: Option<i64>,
     pub has_claim_password: bool,
     pub recurrence: Option<String>,
-    // Phase 4 Additive: Dead Man's Switch
     pub is_emergency: bool,
 }
 
@@ -299,7 +305,6 @@ impl Delivery {
             link_max_views: rec.link_max_views,
             has_claim_password: rec.claim_password_hash.is_some(),
             recurrence: rec.recurrence.clone(),
-            // Phase 4 Additive mapping
             is_emergency: rec.is_emergency != 0,
         })
     }
@@ -328,7 +333,6 @@ pub struct NewDelivery {
     pub claim_password: Option<String>,
     #[serde(default)]
     pub recurrence: Option<String>,
-    // Phase 4 Additive: Dead Man's Switch
     #[serde(default)]
     pub is_emergency: Option<bool>,
 }
@@ -337,13 +341,17 @@ fn default_channel() -> DeliveryChannel {
     DeliveryChannel::Email
 }
 
+// ------------------------------------------------------------- PHASE 15: Updated Payment Structs
+
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct PaymentPlan {
     pub id: String,
     pub name: String,
-    pub deliveries: i64,
-    pub price: f64,
+    pub emails: i64,
+    pub sms: i64,
     pub price_in_kobo: i64,
+    pub is_subscription: bool,
+    pub description: String,
     pub currency: String,
 }
 
@@ -368,7 +376,8 @@ pub struct PaymentResponse {
 pub struct PaymentVerification {
     pub verified: bool,
     pub status: String,
-    pub credits_added: i64,
+    pub emails_added: i64,
+    pub sms_added: i64,
     pub message: String,
 }
 
@@ -382,6 +391,7 @@ pub struct PaymentRecord {
     pub status: String,
     pub created_at: DateTime<Utc>,
     pub verified_at: Option<DateTime<Utc>>,
+    pub redeemed_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]

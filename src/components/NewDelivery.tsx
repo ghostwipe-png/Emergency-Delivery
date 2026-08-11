@@ -102,6 +102,10 @@ const normalizeUpload = (raw: any): UploadInfo => {
 const NewDelivery: React.FC<NewDeliveryProps> = ({ onDone }) => {
   const { refreshUser, sessionToken, user } = useAppContext();
 
+  // PHASE 15: Extract split balances for UI Paywall
+  const emailCredits = (user as any)?.delivery_credits ?? 0;
+  const smsCredits = (user as any)?.sms_balance ?? 0;
+
   const [mainTab, setMainTab] = useState<MainTab>('email');
   const [contentTab, setContentTab] = useState<EmailContentTab>('typed');
 
@@ -144,6 +148,9 @@ const NewDelivery: React.FC<NewDeliveryProps> = ({ onDone }) => {
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
   const [showPaymentModal, setShowPaymentModal] = useState(false);
+
+  // PHASE 15: SMS Paywall Logic (Allow send if Free Tier > 0 OR Paid Credits > 0)
+  const canSendSms = (smsStatus?.freeRemaining ?? 0) > 0 || smsCredits > 0;
 
   const parsedBulkEmails = bulkMode
     ? Array.from(
@@ -886,13 +893,22 @@ const NewDelivery: React.FC<NewDeliveryProps> = ({ onDone }) => {
               </label>
             </div>
 
+            {/* Phase 15: Email Paywall Warning */}
+            {emailCredits <= 0 && (
+              <p className="text-red-400 text-xs text-center mb-2 animate-pulse font-medium">
+                ⚠️ You have 0 Email credits. Please upgrade to send.
+              </p>
+            )}
+
             <button
               onClick={handleScheduleEmail}
-              disabled={loading || uploading}
-              className="btn-primary w-full bg-[#00a884] hover:bg-[#06cf9c] text-white font-bold py-3 rounded-xl transition-colors disabled:opacity-50"
+              disabled={loading || uploading || emailCredits <= 0}
+              className="btn-primary w-full bg-[#00a884] hover:bg-[#06cf9c] text-white font-bold py-3 rounded-xl transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
             >
               {loading
                 ? 'Scheduling...'
+                : emailCredits <= 0
+                ? 'Out of Email Credits'
                 : preset === 'now'
                 ? 'Send Now'
                 : 'Schedule Delivery'}
@@ -964,12 +980,28 @@ const NewDelivery: React.FC<NewDeliveryProps> = ({ onDone }) => {
               )}
             </div>
 
+            {/* Phase 15: SMS Paywall Warning */}
+            {!canSendSms && !loadingStatus && (
+              <p className="text-red-400 text-xs text-center mb-2 animate-pulse font-medium">
+                ⚠️ You have 0 SMS credits. Please upgrade to send.
+              </p>
+            )}
+
             <button
               onClick={handleSendSms}
-              disabled={loading || smsMessage.length === 0 || smsMessage.length > MAX_SMS_LEN}
-              className="btn-primary w-full bg-[#00a884] hover:bg-[#06cf9c] text-white font-bold py-3 rounded-xl transition-colors disabled:opacity-50"
+              disabled={
+                loading || 
+                smsMessage.length === 0 || 
+                smsMessage.length > MAX_SMS_LEN || 
+                !canSendSms
+              }
+              className="btn-primary w-full bg-[#00a884] hover:bg-[#06cf9c] text-white font-bold py-3 rounded-xl transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
             >
-              {loading ? 'Sending SMS...' : 'Send SMS'}
+              {loading 
+                ? 'Sending SMS...' 
+                : !canSendSms 
+                ? 'Out of SMS Credits' 
+                : 'Send SMS'}
             </button>
 
             <p className="text-xs text-[#8696a0] text-center">

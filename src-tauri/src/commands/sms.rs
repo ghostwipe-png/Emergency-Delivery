@@ -56,21 +56,23 @@ pub async fn send_sms(
         _ => "Recipient".to_string(),
     };
 
-    let balance = db::get_sms_balance(&state.db, &user.id).await?;
+        let balance = db::get_sms_balance(&state.db, &user.id).await?;
     let use_free = balance.free_sms_used < db::FREE_SMS_LIMIT;
-    if !use_free && !db::decrement_credits(&state.db, &user.id).await? {
-        return Err(AppError::Payment(
-            "insufficient credits for SMS — purchase a plan to continue".into(),
-        ));
+    
+    // PHASE 15: Deduct 1 paid SMS credit before sending (if not using free tier)
+    // If they have 0 SMS credits, this returns an error and instantly blocks the send.
+    if !use_free {
+        db::deduct_credit(&state.db, &user.id, 0, 1, "sms_send").await?;
     }
 
     // Use `match` so `err` is moved (owned), not borrowed — avoids Clone.
     let message_id = match mobitech.send_sms(&phone, &message).await {
         Ok(id) => id,
         Err(err) => {
-            // Compensate the debited credit on failure.
+            // Compensate the debited credit on failure using a "negative deduction".
+            // Passing -1 safely adds the credit back AND logs the refund to the immutable ledger!
             if !use_free {
-                let _ = db::increment_credits(&state.db, &user.id, 1).await;
+                let _ = db::deduct_credit(&state.db, &user.id, 0, -1, "sms_send_refund").await;
             }
             return Err(err);
         }

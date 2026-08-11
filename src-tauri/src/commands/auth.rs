@@ -92,6 +92,9 @@ pub async fn register_user(
     )
     .await?;
 
+    // PHASE 15: Grant one-time registration bonus (5 free email credits)
+    let _ = db::claim_registration_bonus(&state.db, &user_id).await;
+
     let _ = db::append_audit_log(&state.db, &user_id, "account_created", Some(&email)).await;
 
     let user = db::get_user_by_email(&state.db, &email)

@@ -198,12 +198,13 @@ pub async fn schedule_delivery(
         }
     }
 
-    // ---- Atomic credit debit for N recipients ----
-    if !db::decrement_credits_by(&state.db, &user.id, n).await? {
-        return Err(AppError::Payment(format!(
-            "insufficient credits — this delivery costs {n} credit(s)"
-        )));
-    }
+        // ---- PHASE 15: Atomic credit debit for N recipients (Email) ----
+    // Deducts exactly N email credits. SMS cost is 0 because this is an email delivery.
+    // If the user has insufficient credits, this will instantly fail and block the delivery.
+    // It also writes an immutable, permanent entry to the credit_ledger for auditing.
+    db::deduct_credit(&state.db, &user.id, n, 0, "delivery_schedule").await?;
+
+
 
     // ---- Phase 3: Recurrence Validation ----
     let recurrence = match data.recurrence.as_deref() {

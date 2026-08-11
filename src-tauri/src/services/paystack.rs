@@ -1,10 +1,8 @@
-//! Paystack API client (Nigerian payments). HTTPS-only, bearer auth with a
-//! secret key sourced from the environment. The secret key is never logged.
+//! Paystack API client. HTTPS-only, bearer auth with a secret key sourced from the environment.
+//! PHASE 15 HARDENING: Added strict reference matching and currency validation.
 
 use std::time::Duration;
-
 use serde::Deserialize;
-
 use crate::errors::AppError;
 
 #[derive(Clone)]
@@ -31,8 +29,9 @@ pub struct InitData {
 #[derive(Debug, Deserialize)]
 pub struct VerifyData {
     pub status: String,
-    pub amount: i64,
+    pub amount: i64,       // In lowest currency unit (cents/kobo)
     pub reference: String,
+    pub currency: String,  // PHASE 15: Added for strict currency validation
 }
 
 impl PaystackClient {
@@ -60,13 +59,14 @@ impl PaystackClient {
     pub async fn initialize_transaction(
         &self,
         email: &str,
-        amount_kobo: i64,
+        amount_cents: i64, // Paystack expects amount in lowest denomination (KES * 100)
         reference: &str,
     ) -> Result<InitData, AppError> {
         let body = serde_json::json!({
             "email": email,
-            "amount": amount_kobo,
+            "amount": amount_cents,
             "reference": reference,
+            "currency": "KES", // PHASE 15: Hardcode currency to KES
             "channels": ["card", "bank", "ussd", "mobile_money"],
             "metadata": { "product": "emergency-delivery-credits" }
         });
@@ -99,7 +99,6 @@ impl PaystackClient {
     }
 
     pub async fn verify_transaction(&self, reference: &str) -> Result<VerifyData, AppError> {
-        // `reference` is charset-validated by the caller before reaching here.
         let response = self
             .http
             .get(format!("{}/transaction/verify/{}", self.base_url, reference))
@@ -120,8 +119,16 @@ impl PaystackClient {
             )));
         }
 
-        envelope
+        let data = envelope
             .data
-            .ok_or_else(|| AppError::Payment("payment gateway returned no data".into()))
+            .ok_or_else(|| AppError::Payment("payment gateway returned no data".into()))?;
+
+        // PHASE 15 SECURITY: Strict reference matching
+        if data.reference != reference {
+            tracing::error!(expected = %reference, actual = %data.reference, "SECURITY: Paystack reference mismatch!");
+            return Err(AppError::Payment("Reference mismatch in Paystack response".into()));
+        }
+
+        Ok(data)
     }
 }
