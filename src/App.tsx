@@ -12,11 +12,12 @@ import { useNotifications } from './hooks/useNotifications';
 import StatusView from './features/social/StatusView';
 import { useUpdater } from './hooks/useUpdater';
 import GuardianView from './components/GuardianView';
+import InheritanceView from './components/InheritanceView';
 
 const Analytics = lazy(() => import('./components/Analytics'));
 
 // View type keeps all routes available for future re-enablement
-type View = 'dashboard' | 'new' | 'analytics' | 'settings' |  'chat' | 'social' | 'status' | 'guardian';
+type View = 'dashboard' | 'new' | 'analytics' | 'settings' |  'chat' | 'social' | 'status' |  'guardian' | 'inheritance';
 
 const CURRENT_TOS_VERSION = 1;
 
@@ -79,6 +80,8 @@ const App: React.FC = () => {
         return <StatusView />;
       case 'guardian':
         return <GuardianView />;
+      case 'inheritance':
+        return <InheritanceView />;
     }
   };
 
@@ -135,6 +138,13 @@ const App: React.FC = () => {
              currentView === 'guardian' ? 'nav-item-active bg-[#2a3942] text-[#e9edef]' : 'text-[#8696a0] hover:bg-[#202c33]'}`}>
              <span className="text-xl">🛡️</span><span className="font-medium">Guardian</span>
               </button>
+
+          <button
+            onClick={() => setCurrentView('inheritance')}
+            className={`nav-item w-full text-left px-4 py-3 rounded-xl flex items-center space-x-3 transition-colors ${
+              currentView === 'inheritance' ? 'nav-item-active bg-[#2a3942] text-[#e9edef]' : 'text-[#8696a0] hover:bg-[#202c33]'}`}>
+            <span className="text-xl">🧬</span><span className="font-medium">Inheritance</span>
+          </button>
 
           {/* ============================================================
              FUTURE FEATURES — Commented out for focused MVP launch.

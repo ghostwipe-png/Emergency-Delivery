@@ -117,6 +117,26 @@ export const api = {
   cancelGuardianDelivery: (sessionToken: string, lockId: string) =>
     invoke<void>("cancel_guardian_delivery", { sessionToken, lockId }),
 
+    createInheritanceVault: (sessionToken: string, data: any) =>
+    invoke<any>("create_inheritance_vault", { sessionToken, request: data }),
+
+  listInheritanceVaults: (sessionToken: string) =>
+    invoke<any[]>("list_inheritance_vaults", { sessionToken }),
+
+  recoverVaultSecret: (sessionToken: string, vaultId: string) =>
+    invoke<string>("recover_vault_secret", { sessionToken, vaultId }),
+
+  cancelInheritanceVault: (sessionToken: string, vaultId: string) =>
+    invoke<void>("cancel_inheritance_vault", { sessionToken, vaultId }),
+
+    triggerInheritanceVault: (sessionToken: string, vaultId: string) =>
+    invoke<void>("trigger_inheritance_vault", {
+      sessionToken,
+      vaultId,
+      workerUrl: import.meta.env.VITE_WORKER_URL || "https://emergency-delivery-dispatch.adipo-gw.workers.dev",
+      workerSecret: import.meta.env.VITE_WORKER_SECRET || "",
+    }),
+
   // --- Phase 16: Voice Recording → SMS Link ---
   scheduleVoiceDelivery: (
     sessionToken: string,

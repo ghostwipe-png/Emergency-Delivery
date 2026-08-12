@@ -19,6 +19,8 @@ pub mod models;
 pub mod services;
 pub mod tray;
 pub mod utils;
+pub mod shamir;
+pub mod db_vault;
 
 use commands::auth::PendingTwoFactor;
 use errors::AppError;
@@ -175,6 +177,7 @@ async fn initialize(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::Er
 
     let db_path = data_dir.join("secure").join("deliveries.db");
     let pool = db::init_pool(&db_path).await?;
+    db_vault::run_vault_migrations(&pool).await?;
     
     // Phase 9: Social Tables
     let _ = crate::services::social::init_social_tables(&pool).await;
@@ -444,6 +447,12 @@ pub fn run() {
             commands::guardian::lock_guardian_delivery,
             commands::guardian::cancel_guardian_delivery,
             commands::guardian::list_guardian_locks,
+            commands::inheritance::create_inheritance_vault,
+            commands::inheritance::list_inheritance_vaults,
+            commands::inheritance::recover_vault_secret,
+            commands::inheritance::cancel_inheritance_vault,
+            commands::inheritance::trigger_inheritance_vault,
+            commands::inheritance::create_vault_letter,
             
 
         ])

@@ -9,6 +9,7 @@ pub mod upload;
 pub mod chat;
 pub mod social;
 pub mod guardian;
+pub mod inheritance;
 
 use crate::db;
 use crate::errors::AppError;
