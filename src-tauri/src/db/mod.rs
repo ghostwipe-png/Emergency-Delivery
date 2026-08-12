@@ -1,5 +1,5 @@
-//! SQLite persistence via sqlx. 
-//! ENTERPRISE MASTER SCHEMA: Self-healing migrations, atomic transactions, 
+//! SQLite persistence via sqlx.
+//! ENTERPRISE MASTER SCHEMA: Self-healing migrations, atomic transactions,
 //! immutable ledgers, and strict foreign key protections.
 
 use std::path::Path;
@@ -38,14 +38,14 @@ pub async fn init_pool(db_path: &Path) -> Result<DbPool, AppError> {
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    
+
     // Enterprise-grade SQLite PRAGMAs for maximum reliability and performance
     let options = SqliteConnectOptions::from_str(&db_path.to_string_lossy())
         .map_err(|e| AppError::Config(format!("invalid database path: {e}")))?
-        .journal_mode(SqliteJournalMode::Wal) // Write-Ahead Logging for concurrent reads/writes
+        .journal_mode(SqliteJournalMode::Wal)
         .create_if_missing(true)
-        .foreign_keys(true) // Enforce strict relational integrity
-        .busy_timeout(Duration::from_secs(10)); // Prevent immediate crashes on DB locks
+        .foreign_keys(true)
+        .busy_timeout(Duration::from_secs(10));
 
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
@@ -194,12 +194,29 @@ async fn run_migrations(pool: &DbPool) -> Result<(), AppError> {
             reference TEXT,
             created_at TEXT NOT NULL
         )",
+        // =====================================================================
+        // PHASE GUARDIAN: Tamper-proof irrevocable delivery vault (standalone)
+        // =====================================================================
+        "CREATE TABLE IF NOT EXISTS guardian_locks (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            channel TEXT NOT NULL,
+            scheduled_for TEXT NOT NULL,
+            cooling_off_until TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            seal_hash TEXT NOT NULL,
+            seal_salt TEXT NOT NULL,
+            payload_enc TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )",
         "CREATE INDEX IF NOT EXISTS idx_deliveries_status ON deliveries(status)",
         "CREATE INDEX IF NOT EXISTS idx_deliveries_user ON deliveries(user_id)",
         "CREATE INDEX IF NOT EXISTS idx_deliveries_scheduled ON deliveries(scheduled_for)",
         "CREATE INDEX IF NOT EXISTS idx_deliveries_token ON deliveries(delivery_token)",
         "CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at)",
-        "CREATE INDEX IF NOT EXISTS idx_audit_logs_user ON audit_logs(user_id)"
+        "CREATE INDEX IF NOT EXISTS idx_audit_logs_user ON audit_logs(user_id)",
+        "CREATE INDEX IF NOT EXISTS idx_guardian_locks_user ON guardian_locks(user_id)",
+        "CREATE INDEX IF NOT EXISTS idx_guardian_locks_status ON guardian_locks(status, cooling_off_until)"
     ];
 
     // Commit table creations in a single transaction
@@ -210,7 +227,7 @@ async fn run_migrations(pool: &DbPool) -> Result<(), AppError> {
     tx.commit().await?;
 
     // 2. SELF-HEALING SCHEMA EVOLUTION
-    // Run OUTSIDE of a transaction. If an ALTER TABLE fails (because the column already exists), 
+    // Run OUTSIDE of a transaction. If an ALTER TABLE fails (because the column already exists),
     // we silently ignore it. This prevents "Transaction Aborted" panics on startup.
     let _ = sqlx::query("ALTER TABLE users ADD COLUMN tos_version INTEGER NOT NULL DEFAULT 0").execute(pool).await;
     let _ = sqlx::query("ALTER TABLE users ADD COLUMN tos_accepted_at TEXT").execute(pool).await;
@@ -224,7 +241,7 @@ async fn run_migrations(pool: &DbPool) -> Result<(), AppError> {
     let _ = sqlx::query("ALTER TABLE payment_plans ADD COLUMN sms INTEGER NOT NULL DEFAULT 0").execute(pool).await;
     let _ = sqlx::query("ALTER TABLE payment_plans ADD COLUMN is_subscription INTEGER NOT NULL DEFAULT 0").execute(pool).await;
     let _ = sqlx::query("ALTER TABLE payment_plans ADD COLUMN description TEXT NOT NULL DEFAULT ''").execute(pool).await;
-    
+
     let _ = sqlx::query("ALTER TABLE deliveries ADD COLUMN claim_password_hash TEXT").execute(pool).await;
     let _ = sqlx::query("ALTER TABLE deliveries ADD COLUMN claim_password_salt TEXT").execute(pool).await;
     let _ = sqlx::query("ALTER TABLE deliveries ADD COLUMN claim_pw_wrapped_dek TEXT").execute(pool).await;
@@ -232,8 +249,9 @@ async fn run_migrations(pool: &DbPool) -> Result<(), AppError> {
     let _ = sqlx::query("ALTER TABLE deliveries ADD COLUMN worker_registered INTEGER NOT NULL DEFAULT 0").execute(pool).await;
     let _ = sqlx::query("ALTER TABLE deliveries ADD COLUMN worker_payload_enc TEXT").execute(pool).await;
     let _ = sqlx::query("ALTER TABLE deliveries ADD COLUMN is_emergency INTEGER NOT NULL DEFAULT 0").execute(pool).await;
-    
+
     let _ = sqlx::query("ALTER TABLE payments ADD COLUMN redeemed_at TEXT").execute(pool).await;
+    let _ = sqlx::query("ALTER TABLE guardian_locks ADD COLUMN cloud_registered INTEGER NOT NULL DEFAULT 0").execute(pool).await;
 
     Ok(())
 }
@@ -242,16 +260,13 @@ async fn run_migrations(pool: &DbPool) -> Result<(), AppError> {
 // SEED DATA (Self-Healing & Foreign Key Safe)
 // =============================================================================
 async fn seed_payment_plans(pool: &DbPool) -> Result<(), AppError> {
-    // We use INSERT OR REPLACE to safely update plans without deleting rows.
-    // Deleting rows would trigger Foreign Key violations if old payments reference them.
-    // We include legacy columns (deliveries, price) to satisfy old NOT NULL constraints.
     const PLANS: [(&str, &str, i64, f64, i64, i64, i64, i32, &str); 4] = [
         ("starter", "Starter", 100, 250.0, 100, 20, 30000, 0, "100 Emails + 20 SMS credits"),
         ("standard", "Standard", 500, 800.0, 500, 100, 95000, 0, "500 Emails + 100 SMS credits"),
         ("enterprise", "Enterprise", 2000, 3000.0, 2000, 500, 350000, 0, "2,000 Emails + 500 SMS credits"),
         ("unlimited", "Unlimited", 10000, 5000.0, 10000, 2000, 500000, 1, "10,000 Emails + 2,000 SMS per month"),
     ];
-    
+
     for (id, name, legacy_deliveries, legacy_price, emails, sms, kobo, is_sub, desc) in PLANS {
         sqlx::query(
             "INSERT OR REPLACE INTO payment_plans (id, name, deliveries, price, emails, sms, price_in_kobo, is_subscription, description, currency)
@@ -521,6 +536,7 @@ pub async fn get_user_file_keys(pool: &DbPool, user_id: &str) -> Result<Vec<Stri
 
 pub async fn delete_user_completely(pool: &DbPool, user_id: &str) -> Result<(), AppError> {
     let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM guardian_locks WHERE user_id = ?").bind(user_id).execute(&mut *tx).await?;
     sqlx::query("DELETE FROM audit_logs WHERE user_id = ?").bind(user_id).execute(&mut *tx).await?;
     sqlx::query("DELETE FROM credit_ledger WHERE user_id = ?").bind(user_id).execute(&mut *tx).await?;
     sqlx::query("DELETE FROM payments WHERE user_id = ?").bind(user_id).execute(&mut *tx).await?;
@@ -552,7 +568,6 @@ pub async fn update_chat_message(pool: &DbPool, message_id: &str, new_ciphertext
 // PHASE 15: MILITARY-GRADE FINANCIAL CORE
 // =============================================================================
 
-// ATOMICALLY redeem payment with optimistic locking (Anti-Replay & Anti-Double-Credit)
 pub async fn redeem_payment(pool: &DbPool, reference: &str, user_id: &str, email_credits: i64, sms_credits: i64, is_subscription: bool) -> Result<(i64, i64), AppError> {
     let mut tx = pool.begin().await?;
     let result = sqlx::query("UPDATE payments SET status = 'verified', redeemed_at = ? WHERE reference = ? AND status = 'pending'")
@@ -584,7 +599,6 @@ pub async fn redeem_payment(pool: &DbPool, reference: &str, user_id: &str, email
     Ok((new_emails, new_sms))
 }
 
-// ATOMICALLY deduct credits. The WHERE clause ensures balances can NEVER go negative.
 pub async fn deduct_credit(pool: &DbPool, user_id: &str, email_cost: i64, sms_cost: i64, reason: &str) -> Result<(), AppError> {
     let mut tx = pool.begin().await?;
     let result = sqlx::query("UPDATE users SET delivery_credits = delivery_credits - ?, sms_balance = sms_balance - ? WHERE id = ? AND delivery_credits >= ? AND sms_balance >= ?")
@@ -606,7 +620,6 @@ pub async fn deduct_credit(pool: &DbPool, user_id: &str, email_cost: i64, sms_co
     Ok(())
 }
 
-// Claim one-time registration bonus (5 free emails). Optimistic lock prevents farming.
 pub async fn claim_registration_bonus(pool: &DbPool, user_id: &str) -> Result<bool, AppError> {
     let mut tx = pool.begin().await?;
     let result = sqlx::query("UPDATE users SET delivery_credits = delivery_credits + 5, registration_bonus_claimed = 1 WHERE id = ? AND (registration_bonus_claimed = 0 OR registration_bonus_claimed IS NULL)")
@@ -614,7 +627,7 @@ pub async fn claim_registration_bonus(pool: &DbPool, user_id: &str) -> Result<bo
 
     if result.rows_affected() == 0 {
         tx.rollback().await?;
-        return Ok(false); 
+        return Ok(false);
     }
 
     let (new_emails, new_sms): (i64, i64) = sqlx::query_as("SELECT delivery_credits, sms_balance FROM users WHERE id = ?")
@@ -642,4 +655,88 @@ pub async fn get_credit_ledger(pool: &DbPool, user_id: &str, limit: i64) -> Resu
     let rows = sqlx::query_as::<_, (String, String, i64, i64, i64, i64, String, String)>("SELECT id, change_type, email_change, sms_change, balance_emails, balance_sms, reference, created_at FROM credit_ledger WHERE user_id = ? ORDER BY created_at DESC LIMIT ?")
         .bind(user_id).bind(limit).fetch_all(pool).await?;
     Ok(rows)
+}
+
+// =============================================================================
+// GUARDIAN: Irrevocable Vault (standalone module)
+// =============================================================================
+
+pub async fn insert_guardian_lock(
+    pool: &DbPool,
+    id: &str,
+    user_id: &str,
+    channel: &str,
+    scheduled_for: DateTime<Utc>,
+    cooling_off_until: DateTime<Utc>,
+    seal_hash: &str,
+    seal_salt: &str,
+    payload_enc: &str,
+    cloud_registered: i64,
+) -> Result<(), AppError>  {
+        sqlx::query(
+        "INSERT INTO guardian_locks (id, user_id, channel, scheduled_for, cooling_off_until, status, seal_hash, seal_salt, payload_enc, created_at, cloud_registered)
+         VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)"
+    )
+    .bind(id).bind(user_id).bind(channel).bind(scheduled_for).bind(cooling_off_until)
+    .bind(seal_hash).bind(seal_salt).bind(payload_enc).bind(Utc::now()).bind(cloud_registered)
+    .execute(pool).await?;
+    Ok(())
+}
+
+/// Cancel a Guardian lock — only succeeds within the 24h cooling-off window.
+/// After cooling_off_until passes, the lock is irreversibly sealed.
+pub async fn cancel_guardian_lock(
+    pool: &DbPool,
+    id: &str,
+    user_id: &str,
+    now: DateTime<Utc>,
+) -> Result<bool, AppError> {
+    let result = sqlx::query(
+        "UPDATE guardian_locks SET status = 'cancelled'
+         WHERE id = ? AND user_id = ? AND status = 'pending' AND cooling_off_until > ?"
+    )
+    .bind(id).bind(user_id).bind(now)
+    .execute(pool).await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// List all Guardian locks for a user (for UI display)
+pub async fn list_guardian_locks(
+    pool: &DbPool,
+    user_id: &str,
+) -> Result<Vec<(String, String, String, String, String, String)>, AppError> {
+    let rows = sqlx::query_as::<_, (String, String, String, String, String, String)>(
+        "SELECT id, channel, scheduled_for, cooling_off_until, status, created_at
+         FROM guardian_locks WHERE user_id = ? ORDER BY created_at DESC LIMIT 100"
+    )
+    .bind(user_id).fetch_all(pool).await?;
+    Ok(rows)
+}
+
+/// Fetch a single Guardian lock by ID (owner-scoped)
+pub async fn get_guardian_lock(
+    pool: &DbPool,
+    id: &str,
+    user_id: &str,
+) -> Result<Option<(String, String, String, String, String, String, String)>, AppError> {
+    let row = sqlx::query_as::<_, (String, String, String, String, String, String, String)>(
+        "SELECT id, channel, scheduled_for, cooling_off_until, status, seal_salt, payload_enc
+         FROM guardian_locks WHERE id = ? AND user_id = ?"
+    )
+    .bind(id).bind(user_id).fetch_optional(pool).await?;
+    Ok(row)
+}
+/// Guardian locks whose scheduled time has arrived and are still pending.
+/// Only returns locks that have NOT been registered with the cloud (cloud_registered = 0).
+pub async fn due_guardian_locks(pool: &DbPool, now: DateTime<Utc>) -> Result<Vec<(String, String, String)>, AppError> {
+    let rows = sqlx::query_as::<_, (String, String, String)>(
+        "SELECT id, channel, payload_enc FROM guardian_locks WHERE status = 'pending' AND cloud_registered = 0 AND scheduled_for <= ? ORDER BY scheduled_for ASC LIMIT 20"
+    ).bind(now).fetch_all(pool).await?;
+    Ok(rows)
+}
+
+
+pub async fn mark_guardian_delivered(pool: &DbPool, id: &str) -> Result<(), AppError> {
+    sqlx::query("UPDATE guardian_locks SET status = 'delivered' WHERE id = ?").bind(id).execute(pool).await?;
+    Ok(())
 }

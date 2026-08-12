@@ -251,6 +251,11 @@ fn spawn_scheduler(app: &tauri::AppHandle, pool: db::DbPool, shutdown: Arc<Atomi
             // 1. EXISTING: Mark due deliveries as delivered (local scheduler)
             match db::due_deliveries(&pool, Utc::now()).await {
                 Ok(records) => {
+                        // --- Guardian dispatch (fires sealed locks that are due) ---
+                    if let Some(state) = handle.try_state::<AppState>() {
+                        crate::commands::guardian::dispatch_due_guardian_locks(&state).await;
+                    }
+
                     for record in records {
 
                         // ---- Phase 16: Voice → SMS Link Dispatch ----
@@ -435,6 +440,12 @@ pub fn run() {
             commands::social::social_add_contact,
             commands::social::social_list_contacts,
             commands::delivery::schedule_voice_delivery, // <-- Phase 16
+            // --- Phase Guardian: Irrevocable Vault ---
+            commands::guardian::lock_guardian_delivery,
+            commands::guardian::cancel_guardian_delivery,
+            commands::guardian::list_guardian_locks,
+            
+
         ])
         .on_window_event(|window, event| match event {
             tauri::WindowEvent::CloseRequested { api, .. } => {

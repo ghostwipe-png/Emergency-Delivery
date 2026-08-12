@@ -92,6 +92,8 @@ export const api = {
       request: { phone, message, recipient_name: recipientName },
     }),
 
+  
+
   getSmsStatus: (sessionToken: string) =>
     invoke<SmsStatus>("get_sms_status", { sessionToken }),
 
@@ -105,6 +107,15 @@ export const api = {
   // --- Phase 15: Immutable Credit Ledger ---
   getCreditLedger: (sessionToken: string) =>
     invoke<any[]>("get_credit_ledger", { sessionToken }),
+
+  lockGuardianDelivery: (sessionToken: string, data: any) =>
+  invoke<any>("lock_guardian_delivery", { sessionToken, request: data }),
+
+    listGuardianLocks: (sessionToken: string) =>
+    invoke<any[]>("list_guardian_locks", { sessionToken }),
+
+  cancelGuardianDelivery: (sessionToken: string, lockId: string) =>
+    invoke<void>("cancel_guardian_delivery", { sessionToken, lockId }),
 
   // --- Phase 16: Voice Recording → SMS Link ---
   scheduleVoiceDelivery: (
