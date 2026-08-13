@@ -2,6 +2,7 @@ import React, { useState, FormEvent, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { LazyStore } from '@tauri-apps/plugin-store';
 import { useAppContext } from '../context/AppContext';
+import { api } from '../services/api';
 
 const settingsStore = new LazyStore('settings.json');
 type AuthMode = 'login' | 'register';
@@ -15,7 +16,7 @@ interface QuickAccount {
 }
 
 const AuthScreen: React.FC = () => {
-  const { login, register, completeTwoFactor, cancelTwoFactor, pending, loginWithToken } = useAppContext() as any;
+  const { login, completeTwoFactor, cancelTwoFactor, pending, loginWithToken } = useAppContext() as any;
 
   const [mode, setMode] = useState<AuthMode>('login');
   const [name, setName] = useState('');
@@ -77,12 +78,18 @@ const AuthScreen: React.FC = () => {
     setLoading(true);
 
     try {
-      if (mode === 'register') {
+            if (mode === 'register') {
         if (!name.trim()) throw new Error('Name is required.');
         if (name.length > 100) throw new Error('Name must be less than 100 characters.');
         if (password !== confirmPassword) throw new Error('Passwords do not match.');
         if (password.length < 8) throw new Error('Password must be at least 8 characters.');
-        await register(name.trim(), email, password);
+        // Register with the correct 3-argument API signature, then start the session
+        await api.register(name.trim(), email, password);
+        await login(email, password, remember);
+        if (remember) {
+          await settingsStore.set('last_email', email);
+          await settingsStore.save();
+        }
       } else {
         await login(email, password, remember);
         if (remember) {

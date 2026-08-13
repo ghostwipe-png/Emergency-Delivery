@@ -1,0 +1,11 @@
+{
+  "version": "1.1.5",
+  "notes": "Quick Login, Inheritance Vault, Guardian, Payments, Voice & SMS. Silent auto-updates. Emergency Delivery branding.",
+  "pub_date": "2026-08-13T13:30:00Z",
+  "platforms": {
+    "windows-x86_64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUSVpra1Fqdnd2Zm0wS284dThKRFpmMXZqd3hVZzVORU9mWFMzZktaVzc5R2M2K2hLN3dFc0FXK2dZTmRWWlZxWXRUaHhUak5ObDYwUkowWTJSVm1IbUpOVy95SkVkelFJPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg2NjE3MDIwCWZpbGU6RW1lcmdlbmN5IERlbGl2ZXJ5XzEuMS41X3g2NC1zZXR1cC5leGUKMG14bVhQd21lMG8vWW5OSHBVRU9ua2VELzRqOThxQVpmSWM5T3NCenZ3Zm5WdEh6SHk0M08yTEdYNHpKaDlIdFZudFk5aTJ3a0JCcVFxMEpLYTFCQkE9PQo=",
+      "url": "https://github.com/ghostwipe-png/Emergency-Delivery/releases/download/v1.1.5/Emergency.Delivery_1.1.5_x64-setup.exe"
+    }
+  }
+}
