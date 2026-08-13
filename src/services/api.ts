@@ -788,7 +788,7 @@ export const api = {
         vaultId,
         workerUrl:
           import.meta.env.VITE_WORKER_URL ||
-          "https://emergency-delivery-dispatch.adipo-gw.workers.dev",
+          "https://emergency-delivery-dispatch.opinionplus.workers.dev",
         workerSecret: import.meta.env.VITE_WORKER_SECRET || "",
       })
     );
