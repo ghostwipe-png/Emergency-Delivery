@@ -10,6 +10,7 @@ pub mod chat;
 pub mod social;
 pub mod guardian;
 pub mod inheritance;
+pub mod quick_login;
 
 use crate::db;
 use crate::errors::AppError;

@@ -1,6 +1,6 @@
 [package]
 name = "emergency-delivery"
-version = "0.1.0"
+version = "1.1.5"
 description = "Emergency Delivery — secure, scheduled document delivery"
 authors = ["Emergency Delivery"]
 edition = "2021"
@@ -28,7 +28,7 @@ pbkdf2 = { version = "0.12", features = ["hmac"] }
 sha2 = "0.10"
 hmac = "0.12"
 rand = "0.8"
-zeroize = "1"
+zeroize = { version = "1", features = ["derive"] } # UPGRADED: Added derive for auto-wiping structs
 base64 = "0.22"
 hex = "0.4"
 
@@ -39,20 +39,21 @@ sqlx = { version = "0.7", features = ["runtime-tokio-native-tls", "sqlite", "chr
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
-# --- HTTP client (HTTPS-only, rustls) ---
-reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
+# --- HTTP client (HTTPS-only, rustls with OS native roots for corporate proxies) ---
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls-native-roots"] } # UPGRADED: Native roots
 percent-encoding = "2.3"
 
-# --- Async runtime (used for timers + blocking tasks) ---
+# --- Async runtime ---
 tokio = { version = "1", features = ["rt", "time", "macros", "sync"] }
 
-# --- Utilities ---
+# --- Utilities & Observability ---
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.0", features = ["v4", "serde"] }
 anyhow = "1.0"
 thiserror = "1.0"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2" # UPGRADED: Added for log rotation (prevents disk exhaustion)
 dotenv = "0.15"
 rfd = "0.14"
 tauri-plugin-notification = "2.0.0-rc.5"
