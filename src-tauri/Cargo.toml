@@ -1,6 +1,6 @@
 [package]
 name = "emergency-delivery"
-version = "1.1.6"
+version = "1.1.7"
 description = "Emergency Delivery — secure, scheduled document delivery"
 authors = ["Emergency Delivery"]
 edition = "2021"

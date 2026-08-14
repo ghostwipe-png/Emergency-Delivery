@@ -274,16 +274,58 @@ pub async fn trigger_inheritance_vault(
         return Err(AppError::Validation("vault is already open or cancelled".into()));
     }
 
-    // Mark as open in local DB
-    db_vault::set_vault_status(&state.db, &vault_id, &user.id, "open").await?;
-
     // Fetch all shards
     let shards = db_vault::list_vault_shards(&state.db, &vault_id).await?;
 
-    // Send notification email to each beneficiary with their claim link
     let client = reqwest::Client::new();
+    let worker_base = worker_url.trim_end_matches('/');
+
+    // =========================================================================
+    // STEP 1: Register vault + shards in the cloud BEFORE sending emails
+    // =========================================================================
+    let lock_body = serde_json::json!({
+        "vault_id": vault.id,
+        "user_id": user.id,
+        "name": vault.name,
+        "secret_type": vault.secret_type,
+        "m": vault.m,
+        "n": vault.n,
+        "trigger_type": vault.trigger_type,
+        "trigger_time": vault.trigger_time,
+        "shards": shards.iter().map(|s| serde_json::json!({
+            "id": s.id,
+            "idx": s.idx,
+            "name": s.beneficiary_name,
+            "contact": s.beneficiary_contact,
+            "access_hash": s.access_hash,
+            "salt": s.salt,
+            "shard_enc": s.shard_enc
+        })).collect::<Vec<_>>()
+    });
+
+    let lock_res = client.post(format!("{}/vault/lock", worker_base))
+        .header("X-Worker-Secret", &worker_secret)
+        .json(&lock_body)
+        .send()
+        .await
+        .map_err(|e| AppError::Network(format!("Failed to register vault: {}", e)))?;
+
+    if !lock_res.status().is_success() {
+        let status = lock_res.status();
+        let body = lock_res.text().await.unwrap_or_default();
+        return Err(AppError::Worker(format!("Vault registration failed: {} - {}", status, body)));
+    }
+
+    // =========================================================================
+    // STEP 2: Mark as open in local DB
+    // =========================================================================
+    db_vault::set_vault_status(&state.db, &vault_id, &user.id, "open").await?;
+
+    // =========================================================================
+    // STEP 3: Send notification emails to each beneficiary
+    // =========================================================================
     for shard in shards {
-        let claim_url = format!("{}/vault/shard/{}", worker_url.trim_end_matches('/'), shard.id);
+        let claim_url = format!("{}/vault/shard/{}", worker_base, shard.id);
         let email_body = serde_json::json!({
             "from": "Emergency Delivery <notifications@opinionplus.online>",
             "to": [shard.beneficiary_contact],
@@ -303,17 +345,18 @@ pub async fn trigger_inheritance_vault(
             )
         });
 
-        let _ = client.post(format!("{}/send-email", worker_url.trim_end_matches('/')))
+        let _ = client.post(format!("{}/send-email", worker_base))
             .header("X-Worker-Secret", &worker_secret)
             .json(&email_body)
             .send()
             .await;
     }
 
-    // Register the vault as open in the cloud
-    let _ = client.post(format!("{}/vault/open", worker_url.trim_end_matches('/')))
+    // =========================================================================
+    // STEP 4: Mark vault as open in the cloud (for reconstruction)
+    // =========================================================================
+    let _ = client.post(format!("{}/vault/open/{}", worker_base, vault_id))
         .header("X-Worker-Secret", &worker_secret)
-        .json(&serde_json::json!({ "vault_id": vault_id }))
         .send()
         .await;
 
