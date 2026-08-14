@@ -22,6 +22,8 @@ pub enum AppError {
     Storage(String),
     #[error("Network error: {0}")]
     Network(String),
+    #[error("Cloud worker error: {0}")]
+    Worker(String),
     #[error("Configuration error: {0}")]
     Config(String),
     #[error("Internal error: {0}")]
@@ -30,8 +32,26 @@ pub enum AppError {
 
 impl AppError {
     /// Transient errors that are safe to retry with exponential backoff.
+    /// Network failures, storage I/O issues, worker API errors, and busy
+    /// database connections are all retryable.
     pub fn is_retryable(&self) -> bool {
-        matches!(self, AppError::Network(_) | AppError::Storage(_))
+        match self {
+            AppError::Network(_) => true,
+            AppError::Storage(_) => true,
+            AppError::Worker(_) => true,
+            AppError::Database(msg) => msg.contains("busy") || msg.contains("timeout"),
+            _ => false,
+        }
+    }
+
+    /// Check if the error indicates a user-facing problem (not transient).
+    pub fn is_user_error(&self) -> bool {
+        matches!(self,
+            AppError::Validation(_) |
+            AppError::Auth(_) |
+            AppError::NotFound(_) |
+            AppError::Crypto(_)
+        )
     }
 }
 
