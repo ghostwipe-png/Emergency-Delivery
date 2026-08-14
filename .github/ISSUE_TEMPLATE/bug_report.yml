@@ -1,0 +1,71 @@
+name: 🐛 Bug Report
+description: Report a problem in Emergency Delivery
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug report! 🔐 Please redact any secrets or personal data.
+  - type: input
+    id: version
+    attributes:
+      label: App version
+      description: See Settings → System Information
+      placeholder: "1.1.6"
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options: [Windows 11, Windows 10, macOS, Linux]
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Feature area
+      options:
+        - Authentication / Quick Login
+        - Inheritance Vault
+        - Guardian
+        - Deliveries (Email)
+        - SMS
+        - Voice
+        - Payments
+        - Uploads / Files
+        - Chat
+        - Settings
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: happened
+    attributes:
+      label: What happened?
+      description: Include exact error messages.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Go to ...
+        2. Click ...
+        3. See error
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Terminal output or Cloudflare worker logs (redact secrets!)
+      render: shell
