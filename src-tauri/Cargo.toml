@@ -24,7 +24,7 @@ tauri-plugin-opener = "2"
 # --- Security & crypto ---
 aes-gcm = "0.10"
 chacha20poly1305 = "0.10"
-pbkdf2 = { version = "0.12", features = ["hmac"] }
+pbkdf2 = { version = "0.13", features = ["hmac"] }
 sha2 = "0.10"
 hmac = "0.12"
 rand = "0.8"
