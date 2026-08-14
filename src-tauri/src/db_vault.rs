@@ -22,6 +22,8 @@ pub struct VaultRow {
     pub created_at: String,
 }
 
+/// Full shard row including the crypto fields needed for cloud registration.
+/// `access_hash` and `salt` are SQL aliases for `access_code_hash` and `access_code_salt`.
 #[derive(sqlx::FromRow, serde::Serialize, Clone)]
 pub struct VaultShardRow {
     pub id: String,
@@ -29,6 +31,9 @@ pub struct VaultShardRow {
     pub idx: i64,
     pub beneficiary_name: String,
     pub beneficiary_contact: String,
+    pub access_hash: String,
+    pub salt: String,
+    pub shard_enc: String,
     pub status: String,
 }
 
@@ -47,10 +52,12 @@ pub struct VaultLetterRow {
 
 // -----------------------------------------------------------------------------
 // Migrations (idempotent — safe to run every startup)
+// Self-healing: adds missing columns if schema was created with older version.
 // -----------------------------------------------------------------------------
 
 pub async fn run_vault_migrations(pool: &DbPool) -> Result<(), AppError> {
     let statements: &[&str] = &[
+        // Core tables
         "CREATE TABLE IF NOT EXISTS vaults (
             id TEXT PRIMARY KEY,
             user_id TEXT NOT NULL,
@@ -88,9 +95,11 @@ pub async fn run_vault_migrations(pool: &DbPool) -> Result<(), AppError> {
             status TEXT NOT NULL DEFAULT 'locked',
             created_at TEXT NOT NULL
         )",
+        // Indexes
         "CREATE INDEX IF NOT EXISTS idx_vaults_user ON vaults(user_id)",
         "CREATE INDEX IF NOT EXISTS idx_vault_shards_vault ON vault_shards(vault_id)",
-        "CREATE INDEX IF NOT EXISTS idx_vault_letters_user ON vault_letters(user_id)"
+        "CREATE INDEX IF NOT EXISTS idx_vault_letters_user ON vault_letters(user_id)",
+        "CREATE INDEX IF NOT EXISTS idx_vaults_trigger ON vaults(trigger_type, trigger_time, status)"
     ];
 
     let mut tx = pool.begin().await?;
@@ -98,6 +107,20 @@ pub async fn run_vault_migrations(pool: &DbPool) -> Result<(), AppError> {
         sqlx::query(stmt).execute(&mut *tx).await?;
     }
     tx.commit().await?;
+
+    // Self-healing: add columns that older schemas may be missing.
+    // Each ALTER fails silently if the column already exists — that's fine.
+    let heals: &[&str] = &[
+        "ALTER TABLE vaults ADD COLUMN owner_backup_enc TEXT",
+        "ALTER TABLE vault_shards ADD COLUMN access_code_hash TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE vault_shards ADD COLUMN access_code_salt TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE vault_shards ADD COLUMN shard_enc TEXT NOT NULL DEFAULT ''",
+    ];
+    for stmt in heals {
+        // Ignore errors — column likely already exists
+        let _ = sqlx::query(stmt).execute(pool).await;
+    }
+
     Ok(())
 }
 
@@ -118,7 +141,8 @@ pub async fn insert_vault(
     owner_backup_enc: &str,
 ) -> Result<(), AppError> {
     sqlx::query(
-        "INSERT INTO vaults (id, user_id, name, secret_type, m, n, trigger_type, trigger_time, status, owner_backup_enc, created_at)
+        "INSERT OR REPLACE INTO vaults
+         (id, user_id, name, secret_type, m, n, trigger_type, trigger_time, status, owner_backup_enc, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'locked', ?, ?)"
     )
     .bind(id).bind(user_id).bind(name).bind(secret_type).bind(m).bind(n)
@@ -139,7 +163,8 @@ pub async fn insert_vault_shard(
     shard_enc: &str,
 ) -> Result<(), AppError> {
     sqlx::query(
-        "INSERT INTO vault_shards (id, vault_id, idx, beneficiary_name, beneficiary_contact, access_code_hash, access_code_salt, shard_enc, status)
+        "INSERT OR REPLACE INTO vault_shards
+         (id, vault_id, idx, beneficiary_name, beneficiary_contact, access_code_hash, access_code_salt, shard_enc, status)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')"
     )
     .bind(id).bind(vault_id).bind(idx).bind(beneficiary_name).bind(beneficiary_contact)
@@ -161,7 +186,8 @@ pub async fn insert_vault_letter(
     open_at: DateTime<Utc>,
 ) -> Result<(), AppError> {
     sqlx::query(
-        "INSERT INTO vault_letters (id, user_id, vault_id, beneficiary_name, beneficiary_contact, channel, content_type, payload_enc, open_at, status, created_at)
+        "INSERT OR REPLACE INTO vault_letters
+         (id, user_id, vault_id, beneficiary_name, beneficiary_contact, channel, content_type, payload_enc, open_at, status, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'locked', ?)"
     )
     .bind(id).bind(user_id).bind(vault_id).bind(beneficiary_name).bind(beneficiary_contact)
@@ -198,10 +224,18 @@ pub async fn get_vault_backup(pool: &DbPool, id: &str, user_id: &str) -> Result<
     Ok(row.map(|(b,)| b))
 }
 
+/// Fetches shards with crypto fields included (needed for cloud registration).
+/// Column aliases map DB names to the struct field names.
 pub async fn list_vault_shards(pool: &DbPool, vault_id: &str) -> Result<Vec<VaultShardRow>, AppError> {
     let rows = sqlx::query_as::<_, VaultShardRow>(
-        "SELECT id, vault_id, idx, beneficiary_name, beneficiary_contact, status
-         FROM vault_shards WHERE vault_id = ? ORDER BY idx ASC"
+        "SELECT id, vault_id, idx, beneficiary_name, beneficiary_contact,
+                access_code_hash AS access_hash,
+                access_code_salt AS salt,
+                shard_enc,
+                status
+         FROM vault_shards
+         WHERE vault_id = ?
+         ORDER BY idx ASC"
     ).bind(vault_id).fetch_all(pool).await?;
     Ok(rows)
 }
@@ -275,6 +309,11 @@ mod tests {
 
             let shards = list_vault_shards(&pool, "v1").await.unwrap();
             assert_eq!(shards.len(), 2);
+            // Verify crypto fields are correctly aliased
+            assert_eq!(shards[0].access_hash, "hash");
+            assert_eq!(shards[0].salt, "salt");
+            assert_eq!(shards[0].shard_enc, "shard-enc");
+            assert_eq!(shards[1].access_hash, "hash2");
 
             let letters = list_vault_letters(&pool, "u1").await.unwrap();
             assert_eq!(letters.len(), 1);
@@ -288,6 +327,20 @@ mod tests {
 
             // Cancel should fail once open
             assert!(!cancel_vault(&pool, "v1", "u1").await.unwrap());
+        });
+    }
+
+    #[test]
+    fn self_healing_migration() {
+        runtime().block_on(async {
+            let pool = test_pool().await;
+            // Run migrations twice — should be fully idempotent
+            run_vault_migrations(&pool).await.unwrap();
+            run_vault_migrations(&pool).await.unwrap();
+
+            insert_vault(&pool, "v2", "u1", "Test", "secret", 2, 3, "manual", None, "enc").await.unwrap();
+            let vaults = list_vaults(&pool, "u1").await.unwrap();
+            assert_eq!(vaults.len(), 1);
         });
     }
 }
