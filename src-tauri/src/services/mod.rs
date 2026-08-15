@@ -3,7 +3,7 @@
 pub mod cloudflare;
 pub mod mobitech;
 pub mod paystack;
-pub mod chat;
+
 pub mod social;
 
 use std::future::Future;

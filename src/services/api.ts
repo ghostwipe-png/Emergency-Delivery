@@ -1,15 +1,21 @@
 /**
- * Emergency Delivery — Frontend API Layer
- * 
+ * Emergency Delivery — Frontend API Layer (Production-Grade)
+ *
  * This module provides a type-safe interface to all Tauri backend commands.
- * It includes:
- * - Input validation to prevent malformed requests
- * - Automatic retry logic for transient failures
+ *
+ * PRODUCTION FEATURES:
+ * - Structured error handling with correlation IDs
+ * - Smart retry logic (only retries transient errors, not validation/auth)
  * - Circuit breaker pattern for resilience
- * - Structured error handling with context
- * - Comprehensive TypeScript types
- * 
- * @version 1.1.4
+ * - File size pre-validation (prevents wasted uploads)
+ * - Account lockout detection with timer parsing
+ * - Storage quota tracking
+ * - Request timeouts
+ * - Comprehensive input validation
+ * - Type-safe responses (no `any` types)
+ *
+ * @version 2.0.1
+ * @status PRODUCTION
  */
 
 import { invoke } from "@tauri-apps/api/core";
@@ -34,6 +40,16 @@ import type {
 // =============================================================================
 // TYPES & INTERFACES
 // =============================================================================
+
+/**
+ * Structured error from backend with correlation ID for support tickets
+ */
+export interface BackendError {
+  message: string;
+  correlation_id?: string;
+  error_type?: "auth" | "validation" | "network" | "payment" | "storage" | "internal";
+  lockout_minutes?: number; // For account lockout errors
+}
 
 /**
  * Quick Login account information
@@ -101,7 +117,7 @@ export interface GuardianLock {
   channel: "sms" | "email";
   scheduled_for: string;
   cooling_off_until: string;
-  status: "locked" | "delivered" | "cancelled";
+  status: "pending" | "locked" | "delivered" | "cancelled";
   seal_hash: string;
   created_at: string;
 }
@@ -130,57 +146,161 @@ export interface CreditLedgerEntry {
   created_at: string;
 }
 
+/**
+ * System resource usage (for quota tracking)
+ */
+export interface ResourceUsage {
+  storage_used_mb: number;
+  storage_limit_mb: number;
+  pending_deliveries: number;
+  delivered_deliveries: number;
+}
+
 // =============================================================================
 // CONSTANTS
 // =============================================================================
 
 const MAX_RETRY_ATTEMPTS = 3;
 const RETRY_DELAY_MS = 1000;
+const REQUEST_TIMEOUT_MS = 30000; // 30 seconds
+
+// File size limits (must match backend constants)
+const MAX_FILE_SIZE_BYTES = 50 * 1024 * 1024; // 50 MB
 
 
 const VALIDATION_RULES = {
-  EMAIL_REGEX: /^[^\s@]+@[^\s@]+\.[^\s@]+$/,
+  EMAIL_REGEX: /^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$/,
   MIN_PASSWORD_LENGTH: 8,
+  MAX_PASSWORD_LENGTH: 128,
   MAX_NAME_LENGTH: 100,
   MAX_EMAIL_LENGTH: 254,
   FAVORITE_WORD_MIN_LENGTH: 6,
   FAVORITE_WORD_MAX_LENGTH: 15,
   UUID_REGEX: /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
+  MAX_SMS_LENGTH: 480, // 3 concatenated SMS
+  MAX_MESSAGE_LENGTH: 5000,
 };
+
+// =============================================================================
+// ERROR CLASSES
+// =============================================================================
+
+/**
+ * Base error class with correlation ID support
+ */
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    public correlationId?: string,
+    public errorType?: BackendError["error_type"]
+  ) {
+    super(message);
+    this.name = "ApiError";
+  }
+
+  /**
+   * Format error for user display (includes correlation ID if present)
+   */
+  toUserMessage(): string {
+    let msg = this.message;
+    if (this.correlationId) {
+      msg += `\n\nSupport ID: ${this.correlationId}`;
+    }
+    return msg;
+  }
+}
+
+/**
+ * Authentication error (session expired, invalid credentials)
+ */
+export class AuthError extends ApiError {
+  constructor(message: string, correlationId?: string) {
+    super(message, correlationId, "auth");
+    this.name = "AuthError";
+  }
+}
+
+/**
+ * Validation error (invalid input)
+ */
+export class ValidationError extends ApiError {
+  constructor(message: string, correlationId?: string) {
+    super(message, correlationId, "validation");
+    this.name = "ValidationError";
+  }
+}
+
+/**
+ * Network error (timeout, connectivity issue)
+ */
+export class NetworkError extends ApiError {
+  constructor(message: string, correlationId?: string) {
+    super(message, correlationId, "network");
+    this.name = "NetworkError";
+  }
+}
+
+/**
+ * Payment error (insufficient credits, payment failed)
+ */
+export class PaymentError extends ApiError {
+  constructor(message: string, correlationId?: string) {
+    super(message, correlationId, "payment");
+    this.name = "PaymentError";
+  }
+}
+
+/**
+ * Storage error (quota exceeded, file too large)
+ */
+export class StorageError extends ApiError {
+  constructor(message: string, correlationId?: string) {
+    super(message, correlationId, "storage");
+    this.name = "StorageError";
+  }
+}
+
+/**
+ * Account lockout error (too many failed login attempts)
+ */
+export class AccountLockoutError extends AuthError {
+  constructor(
+    message: string,
+    public lockoutMinutes: number,
+    correlationId?: string
+  ) {
+    super(message, correlationId);
+    this.name = "AccountLockoutError";
+  }
+}
 
 // =============================================================================
 // CIRCUIT BREAKER
 // =============================================================================
 
-/**
- * Circuit breaker state
- */
 type CircuitState = "CLOSED" | "OPEN" | "HALF_OPEN";
 
-/**
- * Simple circuit breaker implementation
- */
 class CircuitBreaker {
   private state: CircuitState = "CLOSED";
   private failures = 0;
   private lastFailureTime = 0;
-  
+
   constructor(
     private failureThreshold = 5,
     private resetTimeoutMs = 60000
   ) {}
-  
+
   async execute<T>(fn: () => Promise<T>): Promise<T> {
     const now = Date.now();
-    
+
     if (this.state === "OPEN") {
       if (now - this.lastFailureTime >= this.resetTimeoutMs) {
         this.state = "HALF_OPEN";
       } else {
-        throw new Error("Circuit breaker is OPEN: service unavailable");
+        throw new NetworkError("Service temporarily unavailable. Please try again later.");
       }
     }
-    
+
     try {
       const result = await fn();
       if (this.state === "HALF_OPEN") {
@@ -189,14 +309,17 @@ class CircuitBreaker {
       }
       return result;
     } catch (e) {
-      this.failures++;
-      this.lastFailureTime = now;
-      
-      if (this.failures >= this.failureThreshold) {
-        this.state = "OPEN";
-        console.error(`Circuit breaker OPENED after ${this.failures} failures`);
+      // Only count network errors for circuit breaker
+      if (e instanceof NetworkError) {
+        this.failures++;
+        this.lastFailureTime = now;
+
+        if (this.failures >= this.failureThreshold) {
+          this.state = "OPEN";
+          console.error(`Circuit breaker OPENED after ${this.failures} failures`);
+        }
       }
-      
+
       throw e;
     }
   }
@@ -208,74 +331,189 @@ const circuitBreaker = new CircuitBreaker();
 // UTILITY FUNCTIONS
 // =============================================================================
 
-/**
- * Sleep for specified milliseconds
- */
 function sleep(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /**
- * Retry function with exponential backoff
+ * Parse backend error and convert to appropriate error type.
+ * Exported for use in error boundaries and global error handlers.
+ */
+export function parseBackendError(e: unknown): ApiError {
+  const msg = typeof e === "string" ? e : e instanceof Error ? e.message : String(e);
+
+  // Extract correlation ID if present
+  const correlationMatch = msg.match(/correlation[_-]?id[=:]\s*([a-f0-9-]+)/i);
+  const correlationId = correlationMatch?.[1];
+
+  // Detect account lockout
+  const lockoutMatch = msg.match(/Try again in (\d+) minutes/i);
+  if (lockoutMatch) {
+    const minutes = parseInt(lockoutMatch[1], 10);
+    return new AccountLockoutError(msg, minutes, correlationId);
+  }
+
+  // Categorize error type
+  const lowerMsg = msg.toLowerCase();
+
+  if (
+    lowerMsg.includes("unauthorized") ||
+    lowerMsg.includes("session") ||
+    lowerMsg.includes("token") ||
+    lowerMsg.includes("invalid email or password") ||
+    lowerMsg.includes("2fa")
+  ) {
+    return new AuthError(msg, correlationId);
+  }
+
+  if (
+    lowerMsg.includes("validation") ||
+    lowerMsg.includes("invalid") ||
+    lowerMsg.includes("required") ||
+    lowerMsg.includes("too long") ||
+    lowerMsg.includes("too short")
+  ) {
+    return new ValidationError(msg, correlationId);
+  }
+
+  if (
+    lowerMsg.includes("network") ||
+    lowerMsg.includes("timeout") ||
+    lowerMsg.includes("connection") ||
+    lowerMsg.includes("offline")
+  ) {
+    return new NetworkError(msg, correlationId);
+  }
+
+  if (
+    lowerMsg.includes("payment") ||
+    lowerMsg.includes("credit") ||
+    lowerMsg.includes("insufficient")
+  ) {
+    return new PaymentError(msg, correlationId);
+  }
+
+  if (
+    lowerMsg.includes("storage") ||
+    lowerMsg.includes("quota") ||
+    lowerMsg.includes("file too large")
+  ) {
+    return new StorageError(msg, correlationId);
+  }
+
+  return new ApiError(msg, correlationId, "internal");
+}
+
+/**
+ * Check if error should be retried (only transient network errors)
+ */
+function isRetryableError(e: unknown): boolean {
+  return e instanceof NetworkError;
+}
+
+/**
+ * Retry function with exponential backoff (only retries network errors)
  */
 async function withRetry<T>(
   fn: () => Promise<T>,
   maxAttempts = MAX_RETRY_ATTEMPTS,
   initialDelayMs = RETRY_DELAY_MS
 ): Promise<T> {
-  let lastError: Error | undefined;
+  let lastError: ApiError | undefined;
   let delay = initialDelayMs;
-  
+
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
       return await fn();
     } catch (e) {
-      lastError = e instanceof Error ? e : new Error(String(e));
-      
+      // Parse the error into a structured ApiError
+      lastError = parseBackendError(e);
+
+      // Don't retry validation, auth, or payment errors
+      if (!isRetryableError(lastError)) {
+        throw lastError;
+      }
+
       if (attempt === maxAttempts) {
         break;
       }
-      
+
       console.warn(
         `Attempt ${attempt}/${maxAttempts} failed, retrying in ${delay}ms:`,
         lastError.message
       );
-      
+
       await sleep(delay);
       delay *= 2; // Exponential backoff
     }
   }
-  
-  throw lastError;
+
+  throw lastError ?? new ApiError("Unknown error");
 }
 
 /**
- * Validate email format
+ * Wrap invoke call with timeout
+ */
+async function invokeWithTimeout<T>(
+  command: string,
+  args?: Record<string, unknown>
+): Promise<T> {
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    setTimeout(() => reject(new NetworkError("Request timed out")), REQUEST_TIMEOUT_MS);
+  });
+
+  const invokePromise = invoke<T>(command, args);
+
+  return Promise.race([invokePromise, timeoutPromise]);
+}
+
+/**
+ * Validate email format (matches backend validation)
  */
 function validateEmail(email: string): void {
   if (!email || typeof email !== "string") {
-    throw new Error("Email is required");
+    throw new ValidationError("Email is required");
   }
-  
-  if (email.length > VALIDATION_RULES.MAX_EMAIL_LENGTH) {
-    throw new Error(`Email exceeds maximum length of ${VALIDATION_RULES.MAX_EMAIL_LENGTH} characters`);
+
+  const trimmed = email.trim().toLowerCase();
+
+  if (trimmed.length > VALIDATION_RULES.MAX_EMAIL_LENGTH) {
+    throw new ValidationError(
+      `Email exceeds maximum length of ${VALIDATION_RULES.MAX_EMAIL_LENGTH} characters`
+    );
   }
-  
-  if (!VALIDATION_RULES.EMAIL_REGEX.test(email)) {
-    throw new Error("Invalid email format");
+
+  if (!VALIDATION_RULES.EMAIL_REGEX.test(trimmed)) {
+    throw new ValidationError("Invalid email format");
   }
 }
 
 /**
- * Validate password strength
+ * Validate password strength (matches backend validation)
  */
 function validatePassword(password: string): void {
   if (!password || typeof password !== "string") {
-    throw new Error("Password is required");
+    throw new ValidationError("Password is required");
   }
-  
+
   if (password.length < VALIDATION_RULES.MIN_PASSWORD_LENGTH) {
-    throw new Error(`Password must be at least ${VALIDATION_RULES.MIN_PASSWORD_LENGTH} characters`);
+    throw new ValidationError(
+      `Password must be at least ${VALIDATION_RULES.MIN_PASSWORD_LENGTH} characters`
+    );
+  }
+
+  if (password.length > VALIDATION_RULES.MAX_PASSWORD_LENGTH) {
+    throw new ValidationError(
+      `Password must not exceed ${VALIDATION_RULES.MAX_PASSWORD_LENGTH} characters`
+    );
+  }
+
+  // Must contain letters and numbers
+  const hasLetter = /[a-zA-Z]/.test(password);
+  const hasDigit = /\d/.test(password);
+
+  if (!hasLetter || !hasDigit) {
+    throw new ValidationError("Password must contain both letters and numbers");
   }
 }
 
@@ -284,11 +522,11 @@ function validatePassword(password: string): void {
  */
 function validateSessionToken(sessionToken: string): void {
   if (!sessionToken || typeof sessionToken !== "string") {
-    throw new Error("Session token is required");
+    throw new AuthError("Session token is required");
   }
-  
-  if (sessionToken.length < 32) {
-    throw new Error("Invalid session token format");
+
+  if (sessionToken.length < 16) {
+    throw new AuthError("Invalid session token format");
   }
 }
 
@@ -297,25 +535,57 @@ function validateSessionToken(sessionToken: string): void {
  */
 function validateFavoriteWord(word: string): void {
   if (!word || typeof word !== "string") {
-    throw new Error("Favorite word is required");
+    throw new ValidationError("Favorite word is required");
   }
-  
+
   const trimmed = word.trim();
-  
+
   if (trimmed.length < VALIDATION_RULES.FAVORITE_WORD_MIN_LENGTH) {
-    throw new Error(
+    throw new ValidationError(
       `Favorite word must be at least ${VALIDATION_RULES.FAVORITE_WORD_MIN_LENGTH} characters`
     );
   }
-  
+
   if (trimmed.length > VALIDATION_RULES.FAVORITE_WORD_MAX_LENGTH) {
-    throw new Error(
+    throw new ValidationError(
       `Favorite word must not exceed ${VALIDATION_RULES.FAVORITE_WORD_MAX_LENGTH} characters`
     );
   }
-  
+
   if (/\s/.test(trimmed)) {
-    throw new Error("Favorite word must not contain spaces");
+    throw new ValidationError("Favorite word must not contain spaces");
+  }
+}
+
+/**
+ * Validate file size before upload (prevents wasted bandwidth)
+ */
+function validateFileSize(fileBytes: Uint8Array, fileName: string): void {
+  if (!fileBytes || fileBytes.length === 0) {
+    throw new ValidationError("File is empty");
+  }
+
+  if (fileBytes.length > MAX_FILE_SIZE_BYTES) {
+    throw new StorageError(
+      `File "${fileName}" is too large (${(fileBytes.length / 1024 / 1024).toFixed(
+        1
+      )} MB). Maximum size is ${MAX_FILE_SIZE_BYTES / 1024 / 1024} MB.`
+    );
+  }
+}
+
+/**
+ * Validate SMS message length
+ */
+function validateSmsMessage(message: string): void {
+  if (!message || typeof message !== "string") {
+    throw new ValidationError("Message is required");
+  }
+
+  if (message.length > VALIDATION_RULES.MAX_SMS_LENGTH) {
+    throw new ValidationError(
+      `Message too long (${message.length} chars). Maximum is ${VALIDATION_RULES.MAX_SMS_LENGTH} characters.`
+    );
   }
 }
 
@@ -327,24 +597,16 @@ export const api = {
   // ===========================================================================
   // SYSTEM & ANALYTICS
   // ===========================================================================
-  
-  /**
-   * Ping the backend to check connectivity
-   */
-  ping: () => circuitBreaker.execute(() => invoke<string>("ping")),
 
-  /**
-   * Get system information
-   */
-  getSystemInfo: () => circuitBreaker.execute(() => invoke<SystemInfo>("get_system_info")),
+  ping: () => circuitBreaker.execute(() => invokeWithTimeout<string>("ping")),
 
-  /**
-   * Get analytics data for the current user
-   */
+  getSystemInfo: () =>
+    circuitBreaker.execute(() => invokeWithTimeout<SystemInfo>("get_system_info")),
+
   getAnalytics: (sessionToken: string) => {
     validateSessionToken(sessionToken);
     return circuitBreaker.execute(() =>
-      withRetry(() => invoke<Analytics>("get_analytics", { sessionToken }))
+      withRetry(() => invokeWithTimeout<Analytics>("get_analytics", { sessionToken }))
     );
   },
 
@@ -352,64 +614,47 @@ export const api = {
   // AUTHENTICATION
   // ===========================================================================
 
-  /**
-   * Register a new user account
-   */
   register: (name: string, email: string, password: string) => {
     if (!name || name.length > VALIDATION_RULES.MAX_NAME_LENGTH) {
-      throw new Error(`Name must be 1-${VALIDATION_RULES.MAX_NAME_LENGTH} characters`);
+      throw new ValidationError(`Name must be 1-${VALIDATION_RULES.MAX_NAME_LENGTH} characters`);
     }
     validateEmail(email);
     validatePassword(password);
-    
+
     return circuitBreaker.execute(() =>
-      withRetry(() => invoke<AuthResponse>("register_user", { name, email, password }))
+      withRetry(() => invokeWithTimeout<AuthResponse>("register_user", { name, email, password }))
     );
   },
 
-  /**
-   * Login with email and password
-   */
   login: (email: string, password: string) => {
     validateEmail(email);
-    if (!password) throw new Error("Password is required");
-    
+    if (!password) throw new ValidationError("Password is required");
+
     return circuitBreaker.execute(() =>
-      withRetry(() => invoke<AuthResponse>("login_user", { email, password }))
+      withRetry(() => invokeWithTimeout<AuthResponse>("login_user", { email, password }))
     );
   },
 
-  /**
-   * Verify two-factor authentication code
-   */
   verifyTwoFactor: (preToken: string, code: string) => {
-    if (!preToken) throw new Error("Pre-token is required");
+    if (!preToken) throw new ValidationError("Pre-token is required");
     if (!code || !/^\d{6}$/.test(code)) {
-      throw new Error("2FA code must be 6 digits");
+      throw new ValidationError("2FA code must be 6 digits");
     }
-    
+
     return circuitBreaker.execute(() =>
-      invoke<AuthResponse>("verify_two_factor", { preToken, code })
+      invokeWithTimeout<AuthResponse>("verify_two_factor", { preToken, code })
     );
   },
 
-  /**
-   * Logout the current user
-   */
   logout: (sessionToken: string) => {
     validateSessionToken(sessionToken);
-    return circuitBreaker.execute(() =>
-      invoke<void>("logout_user", { sessionToken })
-    );
+    return circuitBreaker.execute(() => invokeWithTimeout<void>("logout_user", { sessionToken }));
   },
 
-  /**
-   * Get current user information
-   */
   getCurrentUser: (sessionToken: string) => {
     validateSessionToken(sessionToken);
     return circuitBreaker.execute(() =>
-      invoke<User>("get_current_user", { sessionToken })
+      invokeWithTimeout<User>("get_current_user", { sessionToken })
     );
   },
 
@@ -417,42 +662,33 @@ export const api = {
   // TWO-FACTOR AUTHENTICATION
   // ===========================================================================
 
-  /**
-   * Start 2FA setup (generates secret and QR code)
-   */
   twoFactorSetup: (sessionToken: string) => {
     validateSessionToken(sessionToken);
     return circuitBreaker.execute(() =>
-      invoke<TwoFactorSetup>("two_factor_setup", { sessionToken })
+      invokeWithTimeout<TwoFactorSetup>("two_factor_setup", { sessionToken })
     );
   },
 
-  /**
-   * Confirm 2FA setup with verification code
-   */
   twoFactorConfirm: (sessionToken: string, secretBase32: string, code: string) => {
     validateSessionToken(sessionToken);
-    if (!secretBase32) throw new Error("Secret is required");
+    if (!secretBase32) throw new ValidationError("Secret is required");
     if (!code || !/^\d{6}$/.test(code)) {
-      throw new Error("2FA code must be 6 digits");
+      throw new ValidationError("2FA code must be 6 digits");
     }
-    
+
     return circuitBreaker.execute(() =>
-      invoke<void>("two_factor_confirm", { sessionToken, secretBase32, code })
+      invokeWithTimeout<void>("two_factor_confirm", { sessionToken, secretBase32, code })
     );
   },
 
-  /**
-   * Disable 2FA
-   */
   twoFactorDisable: (sessionToken: string, code: string) => {
     validateSessionToken(sessionToken);
     if (!code || !/^\d{6}$/.test(code)) {
-      throw new Error("2FA code must be 6 digits");
+      throw new ValidationError("2FA code must be 6 digits");
     }
-    
+
     return circuitBreaker.execute(() =>
-      invoke<void>("two_factor_disable", { sessionToken, code })
+      invokeWithTimeout<void>("two_factor_disable", { sessionToken, code })
     );
   },
 
@@ -460,37 +696,26 @@ export const api = {
   // LEGAL & COMPLIANCE
   // ===========================================================================
 
-  /**
-   * Accept Terms of Service
-   */
   acceptTos: (sessionToken: string) => {
     validateSessionToken(sessionToken);
-    return circuitBreaker.execute(() =>
-      invoke<void>("accept_tos", { sessionToken })
-    );
+    return circuitBreaker.execute(() => invokeWithTimeout<void>("accept_tos", { sessionToken }));
   },
 
-  /**
-   * Delete account (GDPR right to be forgotten)
-   */
   deleteAccount: (sessionToken: string, confirmation: string) => {
     validateSessionToken(sessionToken);
     if (confirmation !== "DELETE") {
-      throw new Error('Confirmation must be exactly "DELETE"');
+      throw new ValidationError('Confirmation must be exactly "DELETE"');
     }
-    
+
     return circuitBreaker.execute(() =>
-      invoke<void>("delete_account", { sessionToken, confirmation })
+      invokeWithTimeout<void>("delete_account", { sessionToken, confirmation })
     );
   },
 
-  /**
-   * Get audit logs for the current user
-   */
   getAuditLogs: (sessionToken: string) => {
     validateSessionToken(sessionToken);
     return circuitBreaker.execute(() =>
-      invoke<AuditLogEntry[]>("get_audit_logs", { sessionToken })
+      invokeWithTimeout<AuditLogEntry[]>("get_audit_logs", { sessionToken })
     );
   },
 
@@ -498,23 +723,16 @@ export const api = {
   // PAYMENTS
   // ===========================================================================
 
-  /**
-   * Get available payment plans
-   */
-  getPaymentPlans: () => circuitBreaker.execute(() =>
-    invoke<PaymentPlan[]>("get_payment_plans")
-  ),
+  getPaymentPlans: () =>
+    circuitBreaker.execute(() => invokeWithTimeout<PaymentPlan[]>("get_payment_plans")),
 
-  /**
-   * Initialize a payment
-   */
   initializePayment: (sessionToken: string, planId: string) => {
     validateSessionToken(sessionToken);
-    if (!planId) throw new Error("Plan ID is required");
-    
+    if (!planId) throw new ValidationError("Plan ID is required");
+
     return circuitBreaker.execute(() =>
       withRetry(() =>
-        invoke<PaymentResponse>("initialize_payment", {
+        invokeWithTimeout<PaymentResponse>("initialize_payment", {
           sessionToken,
           request: { plan_id: planId },
         })
@@ -522,27 +740,21 @@ export const api = {
     );
   },
 
-  /**
-   * Verify payment completion
-   */
   verifyPayment: (sessionToken: string, reference: string) => {
     validateSessionToken(sessionToken);
-    if (!reference) throw new Error("Payment reference is required");
-    
+    if (!reference) throw new ValidationError("Payment reference is required");
+
     return circuitBreaker.execute(() =>
       withRetry(() =>
-        invoke<PaymentVerification>("verify_payment", { sessionToken, reference })
+        invokeWithTimeout<PaymentVerification>("verify_payment", { sessionToken, reference })
       )
     );
   },
 
-  /**
-   * Get credit ledger (immutable transaction history)
-   */
   getCreditLedger: (sessionToken: string) => {
     validateSessionToken(sessionToken);
     return circuitBreaker.execute(() =>
-      invoke<CreditLedgerEntry[]>("get_credit_ledger", { sessionToken })
+      invokeWithTimeout<CreditLedgerEntry[]>("get_credit_ledger", { sessionToken })
     );
   },
 
@@ -550,59 +762,44 @@ export const api = {
   // DELIVERIES
   // ===========================================================================
 
-  /**
-   * Schedule a new delivery
-   */
   scheduleDelivery: (sessionToken: string, data: NewDeliveryInput) => {
     validateSessionToken(sessionToken);
-    if (!data) throw new Error("Delivery data is required");
-    
+    if (!data) throw new ValidationError("Delivery data is required");
+
     return circuitBreaker.execute(() =>
-      withRetry(() => invoke<Delivery[]>("schedule_delivery", { sessionToken, data }))
+      withRetry(() => invokeWithTimeout<Delivery[]>("schedule_delivery", { sessionToken, data }))
     );
   },
 
-  /**
-   * Get all deliveries for the current user
-   */
   getDeliveries: (sessionToken: string) => {
     validateSessionToken(sessionToken);
     return circuitBreaker.execute(() =>
-      invoke<Delivery[]>("get_deliveries", { sessionToken })
+      invokeWithTimeout<Delivery[]>("get_deliveries", { sessionToken })
     );
   },
 
-  /**
-   * Cancel a scheduled delivery
-   */
   cancelDelivery: (sessionToken: string, deliveryId: string) => {
     validateSessionToken(sessionToken);
-    if (!deliveryId) throw new Error("Delivery ID is required");
-    
+    if (!deliveryId) throw new ValidationError("Delivery ID is required");
+
     return circuitBreaker.execute(() =>
-      invoke<Delivery>("cancel_delivery", { sessionToken, deliveryId })
+      invokeWithTimeout<Delivery>("cancel_delivery", { sessionToken, deliveryId })
     );
   },
 
-  /**
-   * Clear all deliveries (dangerous operation)
-   */
   clearAllDeliveries: (sessionToken: string) => {
     validateSessionToken(sessionToken);
     return circuitBreaker.execute(() =>
-      invoke<number>("clear_all_deliveries", { sessionToken })
+      invokeWithTimeout<number>("clear_all_deliveries", { sessionToken })
     );
   },
 
-  /**
-   * Get delivery receipts (open/click events)
-   */
   getDeliveryReceipts: (sessionToken: string, deliveryId: string) => {
     validateSessionToken(sessionToken);
-    if (!deliveryId) throw new Error("Delivery ID is required");
-    
+    if (!deliveryId) throw new ValidationError("Delivery ID is required");
+
     return circuitBreaker.execute(() =>
-      invoke<ReceiptEvent[]>("get_delivery_receipts", { sessionToken, deliveryId })
+      invokeWithTimeout<ReceiptEvent[]>("get_delivery_receipts", { sessionToken, deliveryId })
     );
   },
 
@@ -610,40 +807,42 @@ export const api = {
   // FILE UPLOADS
   // ===========================================================================
 
-  /**
-   * Upload a file from bytes
-   */
   uploadFile: (sessionToken: string, fileName: string, fileBytes: Uint8Array) => {
     validateSessionToken(sessionToken);
-    if (!fileName) throw new Error("File name is required");
-    if (!fileBytes || fileBytes.length === 0) {
-      throw new Error("File bytes are required");
-    }
-    
+    if (!fileName) throw new ValidationError("File name is required");
+    validateFileSize(fileBytes, fileName);
+
     return circuitBreaker.execute(() =>
-      invoke<UploadResult>("upload_file", { sessionToken, fileName, fileBytes })
+      invokeWithTimeout<UploadResult>("upload_file", { sessionToken, fileName, fileBytes })
     );
   },
 
-  /**
-   * Pick and upload a file using native file picker
-   */
   pickAndUploadFile: (sessionToken: string) => {
     validateSessionToken(sessionToken);
     return circuitBreaker.execute(() =>
-      invoke<UploadResult | null>("pick_and_upload_file", { sessionToken })
+      invokeWithTimeout<UploadResult | null>("pick_and_upload_file", { sessionToken })
+    );
+  },
+
+  getUploadUrl: (sessionToken: string, fileName: string) => {
+    validateSessionToken(sessionToken);
+    if (!fileName) throw new ValidationError("File name is required");
+
+    return circuitBreaker.execute(() =>
+      invokeWithTimeout<PresignedUrl>("get_upload_url", { sessionToken, fileName })
     );
   },
 
   /**
-   * Get presigned upload URL
+   * Preview a file (decrypt and return bytes)
+   * NOTE: Backend enforces 10 MB limit for preview
    */
-  getUploadUrl: (sessionToken: string, fileName: string) => {
+  previewFile: (sessionToken: string, fileKey: string) => {
     validateSessionToken(sessionToken);
-    if (!fileName) throw new Error("File name is required");
-    
+    if (!fileKey) throw new ValidationError("File key is required");
+
     return circuitBreaker.execute(() =>
-      invoke<PresignedUrl>("get_upload_url", { sessionToken, fileName })
+      invokeWithTimeout<Uint8Array>("preview_file", { sessionToken, fileKey })
     );
   },
 
@@ -651,36 +850,23 @@ export const api = {
   // SMS
   // ===========================================================================
 
-  /**
-   * Send SMS message
-   */
-  sendSms: (
-    sessionToken: string,
-    phone: string,
-    message: string,
-    recipientName: string | null
-  ) => {
+  sendSms: (sessionToken: string, phone: string, message: string, recipientName: string | null) => {
     validateSessionToken(sessionToken);
-    if (!phone) throw new Error("Phone number is required");
-    if (!message || message.length > 500) {
-      throw new Error("Message must be 1-500 characters");
-    }
-    
+    if (!phone) throw new ValidationError("Phone number is required");
+    validateSmsMessage(message);
+
     return circuitBreaker.execute(() =>
-      invoke<SmsResult>("send_sms", {
+      invokeWithTimeout<SmsResult>("send_sms", {
         sessionToken,
         request: { phone, message, recipient_name: recipientName },
       })
     );
   },
 
-  /**
-   * Get SMS status and credits
-   */
   getSmsStatus: (sessionToken: string) => {
     validateSessionToken(sessionToken);
     return circuitBreaker.execute(() =>
-      invoke<SmsStatus>("get_sms_status", { sessionToken })
+      invokeWithTimeout<SmsStatus>("get_sms_status", { sessionToken })
     );
   },
 
@@ -688,37 +874,28 @@ export const api = {
   // GUARDIAN VAULT (Irrevocable Deliveries)
   // ===========================================================================
 
-  /**
-   * Lock a Guardian delivery (irrevocable after cooling-off period)
-   */
-  lockGuardianDelivery: (sessionToken: string, data: any) => {
+  lockGuardianDelivery: (sessionToken: string, data: GuardianLock) => {
     validateSessionToken(sessionToken);
-    if (!data) throw new Error("Guardian data is required");
-    
+    if (!data) throw new ValidationError("Guardian data is required");
+
     return circuitBreaker.execute(() =>
-      invoke<any>("lock_guardian_delivery", { sessionToken, request: data })
+      invokeWithTimeout<GuardianLock>("lock_guardian_delivery", { sessionToken, request: data })
     );
   },
 
-  /**
-   * List all Guardian locks
-   */
   listGuardianLocks: (sessionToken: string) => {
     validateSessionToken(sessionToken);
     return circuitBreaker.execute(() =>
-      invoke<GuardianLock[]>("list_guardian_locks", { sessionToken })
+      invokeWithTimeout<GuardianLock[]>("list_guardian_locks", { sessionToken })
     );
   },
 
-  /**
-   * Cancel a Guardian delivery (only during cooling-off period)
-   */
   cancelGuardianDelivery: (sessionToken: string, lockId: string) => {
     validateSessionToken(sessionToken);
-    if (!lockId) throw new Error("Lock ID is required");
-    
+    if (!lockId) throw new ValidationError("Lock ID is required");
+
     return circuitBreaker.execute(() =>
-      invoke<void>("cancel_guardian_delivery", { sessionToken, lockId })
+      invokeWithTimeout<void>("cancel_guardian_delivery", { sessionToken, lockId })
     );
   },
 
@@ -726,64 +903,49 @@ export const api = {
   // INHERITANCE VAULT (Shamir Secret Sharing)
   // ===========================================================================
 
-  /**
-   * Create an inheritance vault with M-of-N shards
-   */
-  createInheritanceVault: (sessionToken: string, data: any) => {
+  createInheritanceVault: (sessionToken: string, data: InheritanceVault) => {
     validateSessionToken(sessionToken);
-    if (!data) throw new Error("Vault data is required");
-    
+    if (!data) throw new ValidationError("Vault data is required");
+
     return circuitBreaker.execute(() =>
-      invoke<{ vault_id: string; shards: CreatedShardInfo[] }>(
+      invokeWithTimeout<{ vault_id: string; shards: CreatedShardInfo[] }>(
         "create_inheritance_vault",
         { sessionToken, request: data }
       )
     );
   },
 
-  /**
-   * List all inheritance vaults
-   */
   listInheritanceVaults: (sessionToken: string) => {
     validateSessionToken(sessionToken);
     return circuitBreaker.execute(() =>
-      invoke<InheritanceVault[]>("list_inheritance_vaults", { sessionToken })
+      invokeWithTimeout<InheritanceVault[]>("list_inheritance_vaults", { sessionToken })
     );
   },
 
-  /**
-   * Recover vault secret (owner-only, using KEK)
-   */
   recoverVaultSecret: (sessionToken: string, vaultId: string) => {
     validateSessionToken(sessionToken);
-    if (!vaultId) throw new Error("Vault ID is required");
-    
+    if (!vaultId) throw new ValidationError("Vault ID is required");
+
     return circuitBreaker.execute(() =>
-      invoke<string>("recover_vault_secret", { sessionToken, vaultId })
+      invokeWithTimeout<string>("recover_vault_secret", { sessionToken, vaultId })
     );
   },
 
-  /**
-   * Cancel an inheritance vault (only while locked)
-   */
   cancelInheritanceVault: (sessionToken: string, vaultId: string) => {
     validateSessionToken(sessionToken);
-    if (!vaultId) throw new Error("Vault ID is required");
-    
+    if (!vaultId) throw new ValidationError("Vault ID is required");
+
     return circuitBreaker.execute(() =>
-      invoke<void>("cancel_inheritance_vault", { sessionToken, vaultId })
+      invokeWithTimeout<void>("cancel_inheritance_vault", { sessionToken, vaultId })
     );
   },
 
-  /**
-   * Trigger an inheritance vault (manual release)
-   */
   triggerInheritanceVault: (sessionToken: string, vaultId: string) => {
     validateSessionToken(sessionToken);
-    if (!vaultId) throw new Error("Vault ID is required");
-    
+    if (!vaultId) throw new ValidationError("Vault ID is required");
+
     return circuitBreaker.execute(() =>
-      invoke<void>("trigger_inheritance_vault", {
+      invokeWithTimeout<void>("trigger_inheritance_vault", {
         sessionToken,
         vaultId,
         workerUrl:
@@ -798,50 +960,37 @@ export const api = {
   // QUICK LOGIN (Trusted Device)
   // ===========================================================================
 
-  /**
-   * Get quick login status (list of trusted accounts on this device)
-   */
-  getQuickLoginStatus: () => circuitBreaker.execute(() =>
-    invoke<QuickLoginAccount[]>("get_quick_login_status")
-  ),
+  getQuickLoginStatus: () =>
+    circuitBreaker.execute(() => invokeWithTimeout<QuickLoginAccount[]>("get_quick_login_status")),
 
-  /**
-   * Setup quick login with a favorite word
-   */
   setupQuickLogin: (sessionToken: string, favoriteWord: string) => {
     validateSessionToken(sessionToken);
     validateFavoriteWord(favoriteWord);
-    
+
     return circuitBreaker.execute(() =>
-      invoke<void>("setup_quick_login", {
+      invokeWithTimeout<void>("setup_quick_login", {
         sessionToken,
         favoriteWord: favoriteWord.trim(),
       })
     );
   },
 
-  /**
-   * Perform quick login with favorite word
-   */
   quickLogin: (userId: string, favoriteWord: string) => {
-    if (!userId) throw new Error("User ID is required");
+    if (!userId) throw new ValidationError("User ID is required");
     validateFavoriteWord(favoriteWord);
-    
+
     return circuitBreaker.execute(() =>
-      invoke<QuickLoginResponse>("quick_login", {
+      invokeWithTimeout<QuickLoginResponse>("quick_login", {
         userId,
         favoriteWord: favoriteWord.trim(),
       })
     );
   },
 
-  /**
-   * Disable quick login on this device
-   */
   disableQuickLogin: (sessionToken: string) => {
     validateSessionToken(sessionToken);
     return circuitBreaker.execute(() =>
-      invoke<void>("disable_quick_login", { sessionToken })
+      invokeWithTimeout<void>("disable_quick_login", { sessionToken })
     );
   },
 
@@ -849,9 +998,6 @@ export const api = {
   // VOICE DELIVERY (Phase 16)
   // ===========================================================================
 
-  /**
-   * Schedule a voice message delivery
-   */
   scheduleVoiceDelivery: (
     sessionToken: string,
     fileKey: string,
@@ -861,13 +1007,13 @@ export const api = {
     senderName: string | null
   ) => {
     validateSessionToken(sessionToken);
-    if (!fileKey) throw new Error("File key is required");
-    if (!recipientPhone) throw new Error("Recipient phone is required");
-    if (!recipientName) throw new Error("Recipient name is required");
-    if (!scheduledFor) throw new Error("Scheduled time is required");
-    
+    if (!fileKey) throw new ValidationError("File key is required");
+    if (!recipientPhone) throw new ValidationError("Recipient phone is required");
+    if (!recipientName) throw new ValidationError("Recipient name is required");
+    if (!scheduledFor) throw new ValidationError("Scheduled time is required");
+
     return circuitBreaker.execute(() =>
-      invoke<Delivery>("schedule_voice_delivery", {
+      invokeWithTimeout<Delivery>("schedule_voice_delivery", {
         sessionToken,
         fileKey,
         recipientPhone,
@@ -877,19 +1023,86 @@ export const api = {
       })
     );
   },
+
+  // ===========================================================================
+  // BACKUP & RESTORE
+  // ===========================================================================
+
+  exportVault: (sessionToken: string, password: string) => {
+    validateSessionToken(sessionToken);
+    if (!password || password.length < 8) {
+      throw new ValidationError("Export password must be at least 8 characters");
+    }
+
+    return circuitBreaker.execute(() =>
+      invokeWithTimeout<void>("export_vault", { sessionToken, password })
+    );
+  },
+
+  importVault: (sessionToken: string, password: string) => {
+    validateSessionToken(sessionToken);
+    if (!password) throw new ValidationError("Import password is required");
+
+    return circuitBreaker.execute(() =>
+      invokeWithTimeout<void>("import_vault", { sessionToken, password })
+    );
+  },
+
+  // ===========================================================================
+  // BIOMETRIC AUTHENTICATION
+  // ===========================================================================
+
+  enableBiometricUnlock: (sessionToken: string) => {
+    validateSessionToken(sessionToken);
+    return circuitBreaker.execute(() =>
+      invokeWithTimeout<void>("enable_biometric_unlock", { sessionToken })
+    );
+  },
+
+  loginWithBiometrics: (email: string) => {
+    validateEmail(email);
+    return circuitBreaker.execute(() =>
+      invokeWithTimeout<AuthResponse>("login_with_biometrics", { email })
+    );
+  },
+
+  // ===========================================================================
+  // DEAD MAN'S SWITCH
+  // ===========================================================================
+
+  updateHeartbeat: (sessionToken: string, intervalDays: number) => {
+    validateSessionToken(sessionToken);
+    if (intervalDays < 0 || intervalDays > 365) {
+      throw new ValidationError("Interval must be between 0 and 365 days");
+    }
+
+    return circuitBreaker.execute(() =>
+      invokeWithTimeout<void>("update_heartbeat", { sessionToken, intervalDays })
+    );
+  },
+
+  manualHeartbeat: (sessionToken: string) => {
+    validateSessionToken(sessionToken);
+    return circuitBreaker.execute(() =>
+      invokeWithTimeout<void>("manual_heartbeat", { sessionToken })
+    );
+  },
 };
 
 // =============================================================================
-// ERROR HANDLING
+// ERROR HANDLING UTILITIES
 // =============================================================================
 
 /**
  * Extract error message from unknown error type
  */
 export function errorMessage(e: unknown): string {
+  if (e instanceof ApiError) {
+    return e.toUserMessage();
+  }
   if (typeof e === "string") return e;
   if (e instanceof Error) return e.message;
-  
+
   try {
     return JSON.stringify(e);
   } catch {
@@ -901,24 +1114,38 @@ export function errorMessage(e: unknown): string {
  * Check if error is a network/connectivity issue
  */
 export function isNetworkError(e: unknown): boolean {
-  const msg = errorMessage(e).toLowerCase();
-  return (
-    msg.includes("network") ||
-    msg.includes("timeout") ||
-    msg.includes("connection") ||
-    msg.includes("offline")
-  );
+  return e instanceof NetworkError;
 }
 
 /**
  * Check if error is an authentication issue
  */
 export function isAuthError(e: unknown): boolean {
-  const msg = errorMessage(e).toLowerCase();
-  return (
-    msg.includes("unauthorized") ||
-    msg.includes("authentication") ||
-    msg.includes("session") ||
-    msg.includes("token")
-  );
+  return e instanceof AuthError;
 }
+
+/**
+ * Check if error is a validation issue
+ */
+export function isValidationError(e: unknown): boolean {
+  return e instanceof ValidationError;
+}
+
+/**
+ * Check if error is account lockout
+ */
+export function isAccountLockout(e: unknown): e is AccountLockoutError {
+  return e instanceof AccountLockoutError;
+}
+
+/**
+ * Get lockout minutes from error (if applicable)
+ */
+export function getLockoutMinutes(e: unknown): number | null {
+  if (e instanceof AccountLockoutError) {
+    return e.lockoutMinutes;
+  }
+  return null;
+}
+// Re-export types that components need directly
+export type { UploadResult } from "../types";

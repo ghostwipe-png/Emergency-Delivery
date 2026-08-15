@@ -6,7 +6,7 @@ pub mod payment;
 pub mod sms;
 pub mod system;
 pub mod upload;
-pub mod chat;
+
 pub mod social;
 pub mod guardian;
 pub mod inheritance;
