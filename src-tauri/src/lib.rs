@@ -737,8 +737,7 @@ fn spawn_memory_monitor(mut shutdown_rx: broadcast::Receiver<()>, _metrics: Arc<
         let correlation_id = uuid::Uuid::new_v4();
         tracing::info!(correlation_id = %correlation_id, "memory monitor started");
 
-        // Allow unused_mut because last_rss is only mutated on Linux
-        #[allow(unused_mut)]
+        #[allow(unused_mut)]  // Only mutated on Linux, suppress warning on Windows/macOS
         let mut last_rss = 0u64;
 
         loop {
@@ -759,14 +758,14 @@ fn spawn_memory_monitor(mut shutdown_rx: broadcast::Receiver<()>, _metrics: Arc<
                             if let Some(kb) = line.split_whitespace().nth(1) {
                                 if let Ok(kb_val) = kb.parse::<u64>() {
                                     let mb = kb_val / 1024;
-                                    if mb > last_rss + 50 {
+                                    if mb > last_rss + 50 {  // ✅ Now works - no underscore
                                         tracing::warn!(
                                             correlation_id = %correlation_id,
                                             rss_mb = mb,
                                             "Memory usage increased significantly"
                                         );
                                     }
-                                    last_rss = mb;
+                                    last_rss = mb;  // ✅ Now works - no underscore
                                     tracing::debug!(
                                         correlation_id = %correlation_id,
                                         rss_mb = mb,
