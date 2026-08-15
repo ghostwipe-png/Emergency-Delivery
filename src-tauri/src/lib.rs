@@ -739,7 +739,7 @@ fn spawn_memory_monitor(mut shutdown_rx: broadcast::Receiver<()>, _metrics: Arc<
 
         // Allow unused_mut because last_rss is only mutated on Linux
         #[allow(unused_mut)]
-        let mut _last_rss = 0u64;
+        let mut last_rss = 0u64;
 
         loop {
             tokio::select! {
