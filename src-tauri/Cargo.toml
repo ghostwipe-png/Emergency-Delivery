@@ -20,13 +20,11 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 # =============================================================================
-# RUNTIME DEPENDENCIES
+# RUNTIME DEPENDENCIES (single-line inline tables only — strict TOML safe)
 # =============================================================================
 
 [dependencies]
-# -----------------------------------------------------------------------------
-# Tauri Core & Plugins (v2 stable)
-# -----------------------------------------------------------------------------
+# --- Tauri Core & Plugins (v2 stable) ---
 tauri = { version = "2", features = ["tray-icon", "custom-protocol"] }
 tauri-plugin-shell = "2"
 tauri-plugin-store = "2"
@@ -38,65 +36,24 @@ bytes = "1"
 futures = "0.3"
 unicode-normalization = "0.1"
 
-# -----------------------------------------------------------------------------
-# Security & Cryptography (Military-Grade)
-# -----------------------------------------------------------------------------
-aes-gcm = "0.10"                       # AES-256-GCM authenticated encryption
-pbkdf2 = { version = "0.12", features = ["hmac"] }  # Password-based key derivation
-hkdf = "0.12"                          # HKDF-SHA256 for sub-key derivation
-sha2 = "0.10"                          # SHA-256 hashing
-hmac = "0.12"                          # HMAC for message authentication
-rand = "0.8"                           # Cryptographically secure RNG
-zeroize = { version = "1.7", features = ["derive"] }  # Secure memory wiping
-base64 = "0.22"                        # Base64 encoding/decoding
-hex = "0.4"                            # Hex encoding/decoding
-totp-rs = { version = "5", features = ["gen_secret", "otpauth"] }  # 2FA TOTP
+# --- Security & Cryptography (Military-Grade) ---
+aes-gcm = "0.10"
+pbkdf2 = { version = "0.12", features = ["hmac"] }
+hkdf = "0.12"
+sha2 = "0.10"
+hmac = "0.12"
+rand = "0.8"
+zeroize = { version = "1.7", features = ["derive"] }
+base64 = "0.22"
+hex = "0.4"
+totp-rs = { version = "5", features = ["gen_secret", "otpauth"] }
 
-# -----------------------------------------------------------------------------
-# Database (SQLite with sqlx)
-# -----------------------------------------------------------------------------
-sqlx = { version = "0.7", features = [
-    "runtime-tokio-native-tls",
-    "sqlite",
-    "chrono",
-    "migrate"
-] }
-
-# -----------------------------------------------------------------------------
-# Serialization
-# -----------------------------------------------------------------------------
+# --- Serialization ---
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
-# -----------------------------------------------------------------------------
-# HTTP Client (HTTPS-only, rustls with OS native roots)
-# -----------------------------------------------------------------------------
-reqwest = {
-    version = "0.11",
-    default-features = false,
-    features = [
-        "json",
-        "rustls-tls-native-roots",     # Uses OS certificate store (corporate proxy safe)
-        "cookies"
-    ]
-}
+# --- Utilities & Observability ---
 percent-encoding = "2.3"
-
-# -----------------------------------------------------------------------------
-# Async Runtime
-# -----------------------------------------------------------------------------
-tokio = { version = "1", features = [
-    "rt",
-    "rt-multi-thread",
-    "time",
-    "macros",
-    "sync",
-    "signal"
-] }
-
-# -----------------------------------------------------------------------------
-# Utilities & Observability
-# -----------------------------------------------------------------------------
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.0", features = ["v4", "serde"] }
 anyhow = "1.0"
@@ -108,33 +65,36 @@ dotenv = "0.15"
 once_cell = "1.19"
 regex = "1.10"
 
-# -----------------------------------------------------------------------------
-# UI & System Integration
-# -----------------------------------------------------------------------------
-rfd = "0.14"                           # File dialogs
+# --- UI & System Integration ---
+rfd = "0.14"
 url = "2.5"
-
-# -----------------------------------------------------------------------------
-# Keyring (PINNED to prevent breaking upgrade to v4)
-# -----------------------------------------------------------------------------
-keyring = "=3.6.3"                     # PINNED: v4 has breaking API changes
-
-# -----------------------------------------------------------------------------
-# WebSocket (for real-time features if needed)
-# -----------------------------------------------------------------------------
+keyring = "=3.6.3"
 tokio-tungstenite = "0.21"
 futures-util = "0.3"
+dirs = "5"
+ansi_term = "0.12"
+ctrlc = "3.4"
+fs2 = "0.4"
 
-# -----------------------------------------------------------------------------
-# Platform-Specific Dependencies (for main.rs)
-# -----------------------------------------------------------------------------
-dirs = "5"                             # Cross-platform directory paths (data_local_dir)
-ansi_term = "0.12"                     # Windows ANSI color support
-ctrlc = "3.4"                          # Ctrl+C signal handler
-fs2 = "0.4"                            # File locking (single instance guard)
+# =============================================================================
+# MULTI-FEATURE DEPENDENCIES (table form — strict TOML safe)
+# =============================================================================
+
+[dependencies.sqlx]
+version = "0.7"
+features = ["runtime-tokio-native-tls", "sqlite", "chrono", "migrate"]
+
+[dependencies.reqwest]
+version = "0.11"
+default-features = false
+features = ["json", "rustls-tls-native-roots", "cookies"]
+
+[dependencies.tokio]
+version = "1"
+features = ["rt", "rt-multi-thread", "time", "macros", "sync", "signal"]
 
 [target.'cfg(unix)'.dependencies]
-signal-hook = "0.3"                    # Unix signal handling (SIGTERM)
+signal-hook = "0.3"
 
 # =============================================================================
 # FEATURES
@@ -143,40 +103,28 @@ signal-hook = "0.3"                    # Unix signal handling (SIGTERM)
 [features]
 default = ["custom-protocol", "single-instance"]
 custom-protocol = ["tauri/custom-protocol"]
-single-instance = []                   # Enable single instance guard (prevents DB corruption)
+single-instance = []
 
 # =============================================================================
-# RELEASE PROFILE (Production-Grade Optimization)
+# PROFILES
 # =============================================================================
 
 [profile.release]
-panic = "abort"                        # Abort on panic (smaller binary, no unwinding)
-codegen-units = 1                      # Single compilation unit (better optimization)
-lto = "fat"                            # Full LTO (better than "true")
-opt-level = "s"                        # Optimize for size (good balance)
-strip = true                           # Remove debug symbols
-debug = false                          # No debug info in release
-
-# =============================================================================
-# DEV PROFILE (Faster compilation for development)
-# =============================================================================
+panic = "abort"
+codegen-units = 1
+lto = "fat"
+opt-level = "s"
+strip = true
+debug = false
 
 [profile.dev]
 opt-level = 0
 debug = true
 strip = false
 
-# =============================================================================
-# TEST PROFILE (Optimized for test execution)
-# =============================================================================
-
 [profile.test]
 opt-level = 1
 debug = true
-
-# =============================================================================
-# BENCH PROFILE (Maximum optimization for benchmarks)
-# =============================================================================
 
 [profile.bench]
 opt-level = 3
