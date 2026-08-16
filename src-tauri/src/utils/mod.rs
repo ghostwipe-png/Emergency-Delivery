@@ -8,7 +8,12 @@
 //! - SVG rejection (XSS risk in SVG files)
 //! - Comprehensive error messages with context
 //!
-//! @version 2.0.0
+//! DELIVERY TIMING:
+//! - Instant deliveries: allowed (time <= now + 5min grace period)
+//! - Scheduled deliveries: must be in the future (up to 5 years)
+//! - No artificial delays: deliveries fire at exact scheduled time
+//!
+//! @version 2.1.0
 //! @status PRODUCTION
 
 use chrono::{DateTime, Utc};
@@ -33,7 +38,10 @@ pub const MAX_FILE_NAME_LEN: usize = 180;
 pub const MAX_MESSAGE_LEN: usize = 5000;
 pub const MAX_SMS_LEN: usize = 480; // 3 concatenated SMS (GSM-7)
 pub const MAX_SCHEDULE_YEARS: i64 = 5;
-pub const MIN_SCHEDULE_MINUTES: i64 = 1; // Minimum 1 minute in future
+
+/// Grace period for instant deliveries (accounts for network/processing latency)
+/// Allows times up to 5 minutes in the past to be treated as "instant"
+pub const INSTANT_GRACE_MINUTES: i64 = 5;
 
 /// Windows reserved device names (case-insensitive)
 const WINDOWS_RESERVED_NAMES: &[&str] = &[
@@ -452,47 +460,74 @@ pub fn sanitize_file_name(name: &str) -> Result<String, AppError> {
 }
 
 // =============================================================================
-// SCHEDULE TIME VALIDATION
+// SCHEDULE TIME VALIDATION (FIXED FOR INSTANT DELIVERY)
 // =============================================================================
 
-/// Validates scheduled delivery time.
+/// Validates scheduled delivery time with support for instant delivery.
 ///
 /// # Rules
-/// - Must be at least 1 minute in the future
-/// - Must be within 5 years
+/// - **Instant delivery**: Times within the last 5 minutes are treated as "now"
+/// - **Scheduled delivery**: Must be in the future (up to 5 years)
+/// - **No artificial delays**: Returns the exact time for precise scheduling
+///
+/// # Instant Delivery Flow
+/// 1. Frontend sends `new Date()` (current time)
+/// 2. Network latency may make it slightly past by arrival
+/// 3. Backend accepts times up to 5 minutes old as "instant"
+/// 4. Scheduler dispatches immediately (no waiting)
+///
+/// # Scheduled Delivery Flow
+/// 1. Frontend sends future timestamp
+/// 2. Backend validates it's within 5 years
+/// 3. Scheduler waits until exact time, then dispatches
 ///
 /// # Example
 /// ```
-/// let when = validate_schedule_time(Utc::now() + Duration::hours(1))?;
+/// // Instant delivery (now or slightly past)
+/// let instant = validate_schedule_time(Utc::now())?;
+/// 
+/// // Scheduled delivery (future)
+/// let future = validate_schedule_time(Utc::now() + Duration::hours(2))?;
+/// 
+/// // Rejected: too far in the past
+/// let old = Utc::now() - Duration::hours(1);
+/// assert!(validate_schedule_time(old).is_err());
 /// ```
 pub fn validate_schedule_time(when: DateTime<Utc>) -> Result<DateTime<Utc>, AppError> {
     let now = Utc::now();
     
-    // Must be in the future
+    // Calculate the grace period boundary (5 minutes ago)
+    let grace_boundary = now - chrono::Duration::minutes(INSTANT_GRACE_MINUTES);
+    
+    // Calculate maximum future limit (5 years)
+    let max_future = now + chrono::Duration::days(365 * MAX_SCHEDULE_YEARS);
+    
+    // Case 1: Time is too far in the past (beyond grace period)
+    if when < grace_boundary {
+        return Err(AppError::Validation(format!(
+            "scheduled time is too far in the past (must be within last {} minutes for instant delivery, or in the future)",
+            INSTANT_GRACE_MINUTES
+        )));
+    }
+    
+    // Case 2: Time is within grace period (instant delivery)
+    // Treat it as "now" for immediate dispatch
     if when <= now {
-        return Err(AppError::Validation(
-            "scheduled time must be in the future".into()
-        ));
+        // Return current time for instant dispatch
+        return Ok(now);
     }
     
-    // Must be at least 1 minute in the future
-    let min_time = now + chrono::Duration::minutes(MIN_SCHEDULE_MINUTES);
-    if when < min_time {
+    // Case 3: Time is in the future (scheduled delivery)
+    if when > max_future {
         return Err(AppError::Validation(format!(
-            "scheduled time must be at least {} minute(s) in the future",
-            MIN_SCHEDULE_MINUTES
+            "scheduled time must be within {} years (got {} days from now)",
+            MAX_SCHEDULE_YEARS,
+            (when - now).num_days()
         )));
     }
     
-    // Must be within 5 years
-    let limit = now + chrono::Duration::days(365 * MAX_SCHEDULE_YEARS);
-    if when > limit {
-        return Err(AppError::Validation(format!(
-            "scheduled time must be within {} years",
-            MAX_SCHEDULE_YEARS
-        )));
-    }
-    
+    // Return the exact scheduled time (no modification)
+    // The scheduler will wait until this exact moment
     Ok(when)
 }
 
@@ -838,16 +873,25 @@ mod tests {
 
     #[test]
     fn test_validate_schedule_time() {
+        // Valid: instant delivery (now)
+        let now = Utc::now();
+        assert!(validate_schedule_time(now).is_ok());
+        
+        // Valid: instant delivery (slightly in the past, within grace period)
+        let slightly_past = Utc::now() - chrono::Duration::minutes(3);
+        assert!(validate_schedule_time(slightly_past).is_ok());
+        
+        // Valid: scheduled delivery (future)
         let future = Utc::now() + chrono::Duration::hours(1);
         assert!(validate_schedule_time(future).is_ok());
         
-        // Invalid: past
-        let past = Utc::now() - chrono::Duration::hours(1);
-        assert!(validate_schedule_time(past).is_err());
+        // Invalid: too far in the past (beyond grace period)
+        let too_old = Utc::now() - chrono::Duration::hours(1);
+        assert!(validate_schedule_time(too_old).is_err());
         
-        // Invalid: too soon
-        let too_soon = Utc::now() + chrono::Duration::seconds(30);
-        assert!(validate_schedule_time(too_soon).is_err());
+        // Invalid: too far in the future (beyond 5 years)
+        let too_far = Utc::now() + chrono::Duration::days(365 * 6);
+        assert!(validate_schedule_time(too_far).is_err());
     }
 
     #[test]
