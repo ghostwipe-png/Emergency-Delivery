@@ -596,6 +596,7 @@ const GuardianView: React.FC = () => {
 
       // Build the Guardian lock payload matching backend's expected structure
       const lockPayload = {
+        content_type: mode === 'file' ? 'file' : 'text', 
         channel,
         file_key: mode === 'file' ? fileInfo?.file_key ?? undefined : undefined,
         message_text: mode !== 'file' ? messageText.trim() : undefined,
