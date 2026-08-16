@@ -22,7 +22,7 @@
 //! - Correlation IDs for distributed tracing
 //! - Rate limiting on background tasks
 //!
-//! @version 2.0.0
+//! @version 2.0.1
 //! @status PRODUCTION
 
 use std::collections::HashMap;
@@ -69,6 +69,7 @@ use services::StorageBackend;
 /// - KEK is wrapped in `Zeroizing` and cleared on logout
 /// - All secrets are compile-time baked (no .env file needed)
 /// - Pending 2FA state is isolated per session
+#[derive(Clone)]
 pub struct AppState {
     pub db: db::DbPool,
     pub storage: StorageBackend,
@@ -79,11 +80,11 @@ pub struct AppState {
     pub worker_secret: Option<String>,
     pub worker_file_key: Option<[u8; crypto::KEY_LEN]>,
     /// Pre-auth state while a user completes their TOTP challenge.
-    pub pending_2fa: Mutex<HashMap<String, PendingTwoFactor>>,
+    pub pending_2fa: Arc<Mutex<HashMap<String, PendingTwoFactor>>>,
     /// Current user's Key Encryption Key (KEK) - zeroized on logout.
-    kek: Mutex<Option<Zeroizing<[u8; crypto::KEY_LEN]>>>,
+    kek: Arc<Mutex<Option<Zeroizing<[u8; crypto::KEY_LEN]>>>>,
     /// Force quit flag (bypasses tray minimize).
-    pub force_quit: AtomicBool,
+    pub force_quit: Arc<AtomicBool>,
     /// Shutdown signal broadcaster (coordinates all background tasks).
     pub shutdown_tx: broadcast::Sender<()>,
     /// Metrics counters for observability.
@@ -426,9 +427,9 @@ async fn initialize(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::Er
         worker_url: config.worker_url.clone(),
         worker_secret: config.worker_secret.clone(),
         worker_file_key: config.worker_file_key,
-        pending_2fa: Mutex::new(HashMap::new()),
-        kek: Mutex::new(None),
-        force_quit: AtomicBool::new(false),
+        pending_2fa: Arc::new(Mutex::new(HashMap::new())),
+        kek: Arc::new(Mutex::new(None)),
+        force_quit: Arc::new(AtomicBool::new(false)),
         shutdown_tx: shutdown_tx.clone(),
         metrics: Arc::new(AppMetrics::new()),
     };
@@ -438,7 +439,7 @@ async fn initialize(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::Er
         tracing::error!("Health check failed: {} (continuing anyway)", e);
     }
 
-    // FIX: Clone metrics Arc BEFORE moving state into app.manage()
+    // Clone metrics Arc BEFORE moving state into app.manage()
     let metrics_for_monitor = Arc::clone(&state.metrics);
     
     app.manage(state);
@@ -737,7 +738,8 @@ fn spawn_memory_monitor(mut shutdown_rx: broadcast::Receiver<()>, _metrics: Arc<
         let correlation_id = uuid::Uuid::new_v4();
         tracing::info!(correlation_id = %correlation_id, "memory monitor started");
 
-        #[allow(unused_mut)]  // Only mutated on Linux, suppress warning on Windows/macOS
+        // Only used on Linux - suppress warning on Windows/macOS
+        #[allow(unused_variables)]
         let mut last_rss = 0u64;
 
         loop {
@@ -758,14 +760,14 @@ fn spawn_memory_monitor(mut shutdown_rx: broadcast::Receiver<()>, _metrics: Arc<
                             if let Some(kb) = line.split_whitespace().nth(1) {
                                 if let Ok(kb_val) = kb.parse::<u64>() {
                                     let mb = kb_val / 1024;
-                                    if mb > last_rss + 50 {  // ✅ Now works - no underscore
+                                    if mb > last_rss + 50 {
                                         tracing::warn!(
                                             correlation_id = %correlation_id,
                                             rss_mb = mb,
                                             "Memory usage increased significantly"
                                         );
                                     }
-                                    last_rss = mb;  // ✅ Now works - no underscore
+                                    last_rss = mb;
                                     tracing::debug!(
                                         correlation_id = %correlation_id,
                                         rss_mb = mb,
@@ -859,6 +861,7 @@ pub fn run() {
             commands::guardian::lock_guardian_delivery,
             commands::guardian::cancel_guardian_delivery,
             commands::guardian::list_guardian_locks,
+            commands::guardian::get_resource_usage,
             commands::inheritance::create_inheritance_vault,
             commands::inheritance::list_inheritance_vaults,
             commands::inheritance::recover_vault_secret,

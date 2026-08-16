@@ -1,15 +1,14 @@
 /**
- * Guardian View — Irrevocable Delivery Vault (Production-Grade)
- *
- * SECURITY FEATURES:
- * - 24-hour cooling-off period (cancellable window)
- * - 6-digit seal code confirmation
- * - Irreversible after cooling-off expires
- * - Structured error handling with correlation IDs
- * - Field-level validation
- * - Accessible confirmation dialogs
- *
- * @version 2.0.0
+ * Guardian View — Advanced Irrevocable Delivery System
+ * 
+ * FEATURES:
+ * - Instant delivery option
+ * - Smart presets (2h, 6h, 12h, 2d, 1w, 1m, 2m)
+ * - Dynamic cancellation windows (1h for <24h, 24h for ≥2d)
+ * - Real-time credit monitoring
+ * - Maximum 2-month scheduling horizon
+ * 
+ * @version 3.0.0
  * @status PRODUCTION
  */
 
@@ -26,12 +25,12 @@ import {
   PaymentError,
   errorMessage,
 } from '../services/api';
-import type { GuardianLock } from '../services/api';
+import type { GuardianLock, ResourceUsage } from '../services/api';
 import type { UploadResult } from '../types';
 import PaymentModal from './PaymentModal';
 
 // =============================================================================
-// TYPES & INTERFACES
+// TYPES
 // =============================================================================
 
 type Step = 'warning' | 'compose' | 'locked';
@@ -51,6 +50,7 @@ interface FormErrors {
   message?: string;
   seal?: string;
   schedule?: string;
+  credits?: string;
 }
 
 // =============================================================================
@@ -63,10 +63,14 @@ const VALIDATION_RULES = {
   MAX_RECIPIENT_NAME_LENGTH: 100,
   MAX_EMAIL_LENGTH: 254,
   SEAL_CODE_LENGTH: 6,
-  COOLING_OFF_HOURS: 24,
+  MAX_SCHEDULE_DAYS: 60, // 2 months maximum
+  INSTANT_COOLDOWN_MS: 0,
+  SHORT_COOLDOWN_HOURS: 1, // 1 hour for <24h deliveries
+  LONG_COOLDOWN_HOURS: 24, // 24 hours for ≥2d deliveries
+  CREDIT_WARNING_THRESHOLD: 10, // Warn when <10 credits
   EMAIL_REGEX: /^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$/,
   KENYA_PHONE_REGEX: /^254(7|1)\d{8}$/,
-  MAX_FILE_SIZE: 50 * 1024 * 1024, // 50MB
+  MAX_FILE_SIZE: 50 * 1024 * 1024,
   ALLOWED_FILE_TYPES: [
     'application/pdf',
     'image/jpeg',
@@ -76,10 +80,14 @@ const VALIDATION_RULES = {
 };
 
 const TIME_PRESETS = [
-  { label: '+1h', ms: 3600000 },
-  { label: '+24h', ms: 86400000 },
-  { label: '+7d', ms: 604800000 },
-  { label: '+30d', ms: 2592000000 },
+  { label: 'Instant', ms: 0, description: 'Deliver now' },
+  { label: '+2h', ms: 2 * 3600000, description: 'In 2 hours' },
+  { label: '+6h', ms: 6 * 3600000, description: 'In 6 hours' },
+  { label: '+12h', ms: 12 * 3600000, description: 'In 12 hours' },
+  { label: '+2d', ms: 2 * 86400000, description: 'In 2 days' },
+  { label: '+1w', ms: 7 * 86400000, description: 'In 1 week' },
+  { label: '+1m', ms: 30 * 86400000, description: 'In 1 month' },
+  { label: '+2m', ms: 60 * 86400000, description: 'In 2 months' },
 ];
 
 // =============================================================================
@@ -103,11 +111,6 @@ const toLocalDate = (d: Date): string => {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
 };
 
-const toLocalTime = (d: Date): string => {
-  const p = (n: number) => String(n).padStart(2, '0');
-  return `${p(d.getHours())}:${p(d.getMinutes())}`;
-};
-
 function isValidEmail(email: string): boolean {
   return VALIDATION_RULES.EMAIL_REGEX.test(email.trim().toLowerCase());
 }
@@ -126,15 +129,29 @@ function formatFileSize(bytes: number): string {
   return Math.round((bytes / Math.pow(k, i)) * 100) / 100 + ' ' + sizes[i];
 }
 
-function isLockCancellable(lock: GuardianLock): boolean {
-  return lock.status === 'pending' && new Date(lock.cooling_off_until).getTime() > Date.now();
+/**
+ * Calculate cancellation window based on scheduled time
+ */
+function calculateCancellationWindow(scheduledFor: Date): { hours: number; label: string } {
+  const now = Date.now();
+  const scheduled = scheduledFor.getTime();
+  const hoursUntilDelivery = (scheduled - now) / (1000 * 60 * 60);
+
+  if (hoursUntilDelivery <= 0) {
+    return { hours: 0, label: 'Instant delivery (no cancellation)' };
+  } else if (hoursUntilDelivery < 24) {
+    return { hours: 1, label: '1 hour to cancel' };
+  } else {
+    return { hours: 24, label: '24 hours to cancel' };
+  }
 }
 
-/**
- * Map content mode to backend channel
- * - 'file' or 'text' → 'email' (delivered via email with claim link)
- * - 'sms' → 'sms' (delivered via SMS with claim link)
- */
+function isLockCancellable(lock: GuardianLock): boolean {
+  const now = Date.now();
+  const coolingOffEnd = new Date(lock.cooling_off_until).getTime();
+  return lock.status === 'pending' && coolingOffEnd > now;
+}
+
 function modeToChannel(mode: ContentMode): DeliveryChannel {
   return mode === 'sms' ? 'sms' : 'email';
 }
@@ -142,6 +159,31 @@ function modeToChannel(mode: ContentMode): DeliveryChannel {
 // =============================================================================
 // SUB-COMPONENTS
 // =============================================================================
+
+const CreditMonitor = memo(({ usage }: { usage: ResourceUsage | null }) => {
+  if (!usage) return null;
+
+  const emailWarning = usage.email_credits_remaining < VALIDATION_RULES.CREDIT_WARNING_THRESHOLD;
+  const smsWarning = usage.sms_credits_remaining < VALIDATION_RULES.CREDIT_WARNING_THRESHOLD;
+
+  if (!emailWarning && !smsWarning) return null;
+
+  return (
+    <div className="bg-yellow-900/20 border border-yellow-900/50 rounded-xl p-4 mb-4" role="alert">
+      <p className="text-sm text-yellow-200 font-bold mb-2">⚠️ Low Credits Warning</p>
+      {emailWarning && (
+        <p className="text-xs text-yellow-200">
+          Email credits: <strong>{usage.email_credits_remaining}</strong> remaining
+        </p>
+      )}
+      {smsWarning && (
+        <p className="text-xs text-yellow-200">
+          SMS credits: <strong>{usage.sms_credits_remaining}</strong> remaining
+        </p>
+      )}
+    </div>
+  );
+});
 
 const ErrorDisplay = memo(
   ({ error, onDismiss }: { error: ApiError | string; onDismiss?: () => void }) => {
@@ -187,9 +229,7 @@ const ErrorDisplay = memo(
         <div className="flex-1 min-w-0">
           <p className="text-sm font-medium break-words">{message}</p>
           {correlationId && (
-            <p className="text-xs opacity-70 mt-1 font-mono">
-              Support ID: {correlationId}
-            </p>
+            <p className="text-xs opacity-70 mt-1 font-mono">Support ID: {correlationId}</p>
           )}
         </div>
         {onDismiss && (
@@ -209,6 +249,7 @@ const ErrorDisplay = memo(
 const LockCard = memo(
   ({ lock, onCancel }: { lock: GuardianLock; onCancel: (id: string) => void }) => {
     const cancellable = isLockCancellable(lock);
+    const cancellationWindow = calculateCancellationWindow(new Date(lock.scheduled_for));
 
     const statusColor = useMemo(() => {
       if (lock.status === 'delivered') return 'text-[#00a884]';
@@ -219,10 +260,12 @@ const LockCard = memo(
 
     const statusText = useMemo(() => {
       if (lock.status === 'pending') {
-        return cancellable ? 'Sealed · cancellable for 24h' : 'IRREVERSIBLE · will be delivered';
+        return cancellable
+          ? `Sealed · ${cancellationWindow.label}`
+          : 'IRREVERSIBLE · will be delivered';
       }
       return lock.status;
-    }, [lock.status, cancellable]);
+    }, [lock.status, cancellable, cancellationWindow]);
 
     return (
       <div
@@ -324,6 +367,7 @@ const GuardianView: React.FC = () => {
   const [success, setSuccess] = useState<string | null>(null);
   const [showPaymentModal, setShowPaymentModal] = useState(false);
   const [formErrors, setFormErrors] = useState<FormErrors>({});
+  const [resourceUsage, setResourceUsage] = useState<ResourceUsage | null>(null);
 
   // Form state
   const [mode, setMode] = useState<ContentMode>('text');
@@ -333,8 +377,9 @@ const GuardianView: React.FC = () => {
   const [recipientName, setRecipientName] = useState('');
   const [recipientEmail, setRecipientEmail] = useState('');
   const [recipientPhone, setRecipientPhone] = useState('');
-  const [date, setDate] = useState(toLocalDate(new Date(Date.now() + 86400000)));
-  const [time, setTime] = useState('09:00');
+  const [selectedPreset, setSelectedPreset] = useState<number | null>(null);
+  const [customDate, setCustomDate] = useState('');
+  const [customTime, setCustomTime] = useState('');
   const [seal1, setSeal1] = useState('');
   const [seal2, setSeal2] = useState('');
 
@@ -348,6 +393,30 @@ const GuardianView: React.FC = () => {
   } | null>(null);
 
   const isSms = useMemo(() => mode === 'sms', [mode]);
+
+  // ===========================================================================
+  // REAL-TIME CREDIT MONITORING
+  // ===========================================================================
+
+  const loadResourceUsage = useCallback(async () => {
+    if (!sessionToken) return;
+
+    try {
+      const usage = await api.getResourceUsage(sessionToken);
+      setResourceUsage(usage);
+    } catch (e) {
+      logger.warn('Failed to load resource usage', { error: String(e) });
+    }
+  }, [sessionToken]);
+
+  useEffect(() => {
+    if (sessionToken) {
+      void loadResourceUsage();
+      // Refresh every 30 seconds
+      const interval = setInterval(loadResourceUsage, 30000);
+      return () => clearInterval(interval);
+    }
+  }, [sessionToken, loadResourceUsage]);
 
   // ===========================================================================
   // DATA LOADING
@@ -367,7 +436,6 @@ const GuardianView: React.FC = () => {
     } catch (e) {
       const apiError = e instanceof ApiError ? e : new ApiError(errorMessage(e));
       logger.error('Failed to load locks', apiError);
-      // Don't show error to user for background load
     }
   }, [sessionToken]);
 
@@ -376,6 +444,26 @@ const GuardianView: React.FC = () => {
       void loadLocks();
     }
   }, [step, loadLocks]);
+
+  // ===========================================================================
+  // SCHEDULE CALCULATION
+  // ===========================================================================
+
+  const getScheduledTime = useCallback((): Date | null => {
+    if (selectedPreset !== null) {
+      const preset = TIME_PRESETS[selectedPreset];
+      if (preset.ms === 0) {
+        return new Date(); // Instant
+      }
+      return new Date(Date.now() + preset.ms);
+    }
+
+    if (customDate && customTime) {
+      return new Date(`${customDate}T${customTime}`);
+    }
+
+    return null;
+  }, [selectedPreset, customDate, customTime]);
 
   // ===========================================================================
   // FILE UPLOAD
@@ -404,7 +492,6 @@ const GuardianView: React.FC = () => {
         throw new ValidationError('Upload failed: missing file key');
       }
 
-      // Validate file size
       if (raw.file_size > VALIDATION_RULES.MAX_FILE_SIZE) {
         throw new StorageError(
           `File too large (${formatFileSize(raw.file_size)}). Maximum size is ${formatFileSize(
@@ -413,7 +500,6 @@ const GuardianView: React.FC = () => {
         );
       }
 
-      // Validate file type
       if (raw.file_type && !VALIDATION_RULES.ALLOWED_FILE_TYPES.includes(raw.file_type)) {
         throw new ValidationError('File type not allowed. Supported: PDF, JPEG, PNG, DOCX');
       }
@@ -430,7 +516,6 @@ const GuardianView: React.FC = () => {
       logger.info('File uploaded successfully', { ...uploadInfo });
     } catch (e) {
       const msg = errorMessage(e).toLowerCase();
-      // Don't show error if user cancelled
       if (!msg.includes('cancel')) {
         const apiError = e instanceof ApiError ? e : new ApiError(errorMessage(e));
         logger.error('File upload failed', apiError);
@@ -442,15 +527,17 @@ const GuardianView: React.FC = () => {
   }, [sessionToken]);
 
   // ===========================================================================
-  // TIME PRESETS
+  // TIME PRESET SELECTION
   // ===========================================================================
 
-  const applyPreset = useCallback((ms: number) => {
-    const d = new Date(Date.now() + ms);
-    setDate(toLocalDate(d));
-    setTime(toLocalTime(d));
-    logger.info('Applied time preset', { ms, date: toLocalDate(d), time: toLocalTime(d) });
-  }, []);
+  const selectPreset = useCallback((index: number) => {
+    setSelectedPreset(index);
+    setCustomDate('');
+    setCustomTime('');
+    if (formErrors.schedule) {
+      setFormErrors((prev) => ({ ...prev, schedule: undefined }));
+    }
+  }, [formErrors]);
 
   // ===========================================================================
   // LOCK OPERATIONS
@@ -462,7 +549,7 @@ const GuardianView: React.FC = () => {
         isOpen: true,
         title: 'Cancel Guardian Delivery?',
         message:
-          'This will cancel the delivery. Only possible within the 24-hour cooling-off window. This action cannot be undone.',
+          'This will cancel the delivery. Only possible within the cancellation window. This action cannot be undone.',
         onConfirm: async () => {
           setConfirmDialog(null);
           if (!sessionToken) {
@@ -478,6 +565,7 @@ const GuardianView: React.FC = () => {
             setSuccess('Guardian delivery cancelled successfully.');
             logger.info('Lock cancelled successfully', { lockId: id });
             await loadLocks();
+            await loadResourceUsage();
           } catch (e) {
             const apiError = e instanceof ApiError ? e : new ApiError(errorMessage(e));
             logger.error('Lock cancellation failed', apiError);
@@ -487,7 +575,7 @@ const GuardianView: React.FC = () => {
         isDestructive: true,
       });
     },
-    [sessionToken, loadLocks]
+    [sessionToken, loadLocks, loadResourceUsage]
   );
 
   // ===========================================================================
@@ -496,6 +584,13 @@ const GuardianView: React.FC = () => {
 
   const validateForm = useCallback((): boolean => {
     const errors: FormErrors = {};
+
+    // Check credits
+    if (isSms && resourceUsage && resourceUsage.sms_credits_remaining <= 0) {
+      errors.credits = 'No SMS credits remaining. Please purchase more.';
+    } else if (!isSms && resourceUsage && resourceUsage.email_credits_remaining <= 0) {
+      errors.credits = 'No email credits remaining. Please purchase more.';
+    }
 
     // Recipient name validation
     if (!recipientName.trim()) {
@@ -551,17 +646,24 @@ const GuardianView: React.FC = () => {
       errors.seal = 'Seal codes do not match';
     }
 
-    // Date/time validation
-    const scheduled = new Date(`${date}T${time}`);
-    if (Number.isNaN(scheduled.getTime())) {
-      errors.schedule = 'Invalid date or time';
-    } else if (scheduled.getTime() < Date.now()) {
-      errors.schedule = 'Choose a future date & time';
+    // Schedule validation
+    const scheduled = getScheduledTime();
+    if (!scheduled) {
+      errors.schedule = 'Select a delivery time';
+    } else {
+      const now = Date.now();
+      const maxFuture = now + VALIDATION_RULES.MAX_SCHEDULE_DAYS * 86400000;
+
+      if (scheduled.getTime() < now) {
+        errors.schedule = 'Choose a future date & time';
+      } else if (scheduled.getTime() > maxFuture) {
+        errors.schedule = `Maximum scheduling is ${VALIDATION_RULES.MAX_SCHEDULE_DAYS} days ahead`;
+      }
     }
 
     setFormErrors(errors);
     return Object.keys(errors).length === 0;
-  }, [recipientName, recipientPhone, recipientEmail, isSms, mode, messageText, fileInfo, seal1, seal2, date, time]);
+  }, [recipientName, recipientPhone, recipientEmail, isSms, mode, messageText, fileInfo, seal1, seal2, getScheduledTime, resourceUsage]);
 
   // ===========================================================================
   // LOCK CREATION
@@ -581,22 +683,30 @@ const GuardianView: React.FC = () => {
       return;
     }
 
+    const scheduled = getScheduledTime();
+    if (!scheduled) {
+      setError(new ValidationError('Invalid schedule time'));
+      return;
+    }
+
     setLoading(true);
 
     try {
-      const scheduled = new Date(`${date}T${time}`);
       const channel = modeToChannel(mode);
+      const cancellationWindow = calculateCancellationWindow(scheduled);
+      const isInstant = scheduled.getTime() <= Date.now();
 
       logger.info('Sealing Guardian delivery', {
         mode,
         channel,
         recipientName,
         scheduledFor: scheduled.toISOString(),
+        cancellationHours: cancellationWindow.hours,
+        isInstant,
       });
 
-      // Build the Guardian lock payload matching backend's expected structure
       const lockPayload = {
-        content_type: mode === 'file' ? 'file' : 'text', 
+        content_type: mode === 'file' ? 'file' : 'text',
         channel,
         file_key: mode === 'file' ? fileInfo?.file_key ?? undefined : undefined,
         message_text: mode !== 'file' ? messageText.trim() : undefined,
@@ -605,20 +715,25 @@ const GuardianView: React.FC = () => {
         recipient_phone: isSms ? recipientPhone.trim() : undefined,
         scheduled_for: scheduled.toISOString(),
         seal_code: seal1,
+        cancellation_hours: cancellationWindow.hours,
       };
 
       await api.lockGuardianDelivery(sessionToken, lockPayload as any);
 
       setStep('locked');
-      setSuccess('Guardian delivery sealed successfully!');
+      setSuccess(
+        isInstant
+          ? 'Guardian delivery sent instantly!'
+          : `Guardian delivery sealed! ${cancellationWindow.label} before it becomes irreversible.`
+      );
       setFormErrors({});
       logger.info('Guardian delivery sealed successfully');
       await refreshUser();
+      await loadResourceUsage();
     } catch (e) {
       const apiError = e instanceof ApiError ? e : new ApiError(errorMessage(e));
       logger.error('Guardian seal failed', apiError);
 
-      // Show payment modal for payment-related errors
       if (apiError instanceof PaymentError) {
         setShowPaymentModal(true);
       }
@@ -627,7 +742,7 @@ const GuardianView: React.FC = () => {
     } finally {
       setLoading(false);
     }
-  }, [sessionToken, validateForm, mode, fileInfo, messageText, recipientName, recipientEmail, recipientPhone, isSms, date, time, seal1, refreshUser, formErrors]);
+  }, [sessionToken, validateForm, mode, fileInfo, messageText, recipientName, recipientEmail, recipientPhone, isSms, seal1, refreshUser, getScheduledTime, loadResourceUsage, formErrors]);
 
   // ===========================================================================
   // RENDER: WARNING SCREEN
@@ -642,20 +757,20 @@ const GuardianView: React.FC = () => {
           </div>
           <h2 className="text-2xl font-bold text-[#e9edef]">Guardian</h2>
           <p className="text-sm text-[#8696a0] mt-2">
-            A guaranteed, tamper-proof delivery that cannot be stopped once sealed.
+            Advanced irrevocable delivery with dynamic cancellation windows.
           </p>
 
           <div
             className="mt-6 bg-yellow-900/20 border border-yellow-900/50 rounded-xl p-4 text-sm text-yellow-200 space-y-2"
             role="alert"
           >
-            <p className="font-bold">⚠️ Irreversible after 24 hours</p>
-            <p>
-              You may cancel within the first <strong>24 hours</strong>. After that, the delivery is{' '}
-              <strong>permanently sealed</strong> and{' '}
-              <strong>cannot be cancelled or stopped by anyone</strong> — even if this app is
-              deleted or this device is destroyed.
-            </p>
+            <p className="font-bold">⚠️ Dynamic Cancellation Windows</p>
+            <ul className="list-disc list-inside space-y-1 text-xs">
+              <li><strong>Instant:</strong> Delivered immediately, no cancellation</li>
+              <li><strong>Less than 24h:</strong> 1 hour to cancel</li>
+              <li><strong>2+ days:</strong> 24 hours to cancel</li>
+              <li><strong>After window:</strong> IRREVERSIBLE, will be delivered</li>
+            </ul>
           </div>
 
           <label className="flex items-start gap-3 mt-6 cursor-pointer select-none">
@@ -667,8 +782,7 @@ const GuardianView: React.FC = () => {
               aria-label="Acknowledge irreversibility warning"
             />
             <span className="text-sm text-[#e9edef]">
-              I understand that after 24 hours this delivery becomes irreversible and will reach its
-              recipient no matter what.
+              I understand the cancellation windows and that after they expire, this delivery becomes irreversible.
             </span>
           </label>
 
@@ -697,13 +811,12 @@ const GuardianView: React.FC = () => {
             🔒
           </div>
           <h2 className="text-2xl font-bold text-[#e9edef]">Sealed in the Vault</h2>
-          <p className="text-sm text-[#8696a0] mt-3">
-            Your Guardian delivery is locked. You can cancel within 24 hours. After that, it is{' '}
-            <strong className="text-[#00a884]">irreversible</strong> and will be delivered no matter
-            what.
-          </p>
+          <p className="text-sm text-[#8696a0] mt-3">{success}</p>
           <button
-            onClick={() => setStep('warning')}
+            onClick={() => {
+              setStep('warning');
+              setSuccess(null);
+            }}
             className="btn-secondary mt-6 px-6 py-2 rounded-xl bg-[#2a3942] text-[#e9edef] hover:bg-[#3a4952] transition-colors"
             aria-label="Create another Guardian delivery"
           >
@@ -733,6 +846,8 @@ const GuardianView: React.FC = () => {
             ✅ {success}
           </div>
         )}
+
+        <CreditMonitor usage={resourceUsage} />
 
         {/* Content mode tabs */}
         <div className="flex bg-[#202c33] p-1 rounded-xl mb-6" role="tablist">
@@ -928,59 +1043,82 @@ const GuardianView: React.FC = () => {
           </div>
         </div>
 
-        {/* Calendar scheduling */}
+        {/* Time Presets */}
         <div className="mt-6">
-          <label className="label text-sm text-[#8696a0] block mb-2">Delivery date & time</label>
-          <div className="flex flex-wrap gap-2 mb-3">
-            {TIME_PRESETS.map((p) => (
+          <label className="label text-sm text-[#8696a0] block mb-2">Delivery Time</label>
+          <div className="grid grid-cols-4 gap-2 mb-3">
+            {TIME_PRESETS.map((p, i) => (
               <button
                 key={p.label}
-                onClick={() => applyPreset(p.ms)}
-                className="px-3 py-1.5 rounded-lg bg-[#202c33] text-[#8696a0] text-xs hover:bg-[#2a3942] hover:text-[#e9edef] transition-colors"
-                aria-label={`Set delivery time to ${p.label} from now`}
+                onClick={() => selectPreset(i)}
+                className={`px-3 py-2 rounded-lg text-xs transition-colors ${
+                  selectedPreset === i
+                    ? 'bg-[#00a884] text-white'
+                    : 'bg-[#202c33] text-[#8696a0] hover:bg-[#2a3942] hover:text-[#e9edef]'
+                }`}
+                aria-label={`Set delivery time to ${p.description}`}
               >
-                {p.label}
+                <div className="font-bold">{p.label}</div>
+                <div className="text-[10px] opacity-70">{p.description}</div>
               </button>
             ))}
           </div>
-          <div className="grid grid-cols-2 gap-4">
-            <input
-              type="date"
-              value={date}
-              min={toLocalDate(new Date())}
-              onChange={(e) => {
-                setDate(e.target.value);
-                if (formErrors.schedule) {
-                  setFormErrors((prev) => ({ ...prev, schedule: undefined }));
-                }
-              }}
-              className={`input bg-[#202c33] text-[#e9edef] p-3 rounded-xl focus:ring-2 focus:ring-[#00a884] transition-all ${
-                formErrors.schedule ? 'border-red-500' : ''
-              }`}
-              aria-label="Delivery date"
-              aria-invalid={!!formErrors.schedule}
-            />
-            <input
-              type="time"
-              value={time}
-              onChange={(e) => {
-                setTime(e.target.value);
-                if (formErrors.schedule) {
-                  setFormErrors((prev) => ({ ...prev, schedule: undefined }));
-                }
-              }}
-              className={`input bg-[#202c33] text-[#e9edef] p-3 rounded-xl focus:ring-2 focus:ring-[#00a884] transition-all ${
-                formErrors.schedule ? 'border-red-500' : ''
-              }`}
-              aria-label="Delivery time"
-              aria-invalid={!!formErrors.schedule}
-              aria-describedby={formErrors.schedule ? 'schedule-error' : undefined}
-            />
+
+          {/* Custom Date/Time */}
+          <div className="panel-2 bg-[#202c33] rounded-xl p-4">
+            <p className="text-xs text-[#8696a0] mb-3">Or choose custom date & time:</p>
+            <div className="grid grid-cols-2 gap-4">
+              <input
+                type="date"
+                value={customDate}
+                min={toLocalDate(new Date())}
+                max={toLocalDate(new Date(Date.now() + VALIDATION_RULES.MAX_SCHEDULE_DAYS * 86400000))}
+                onChange={(e) => {
+                  setCustomDate(e.target.value);
+                  setSelectedPreset(null);
+                  if (formErrors.schedule) {
+                    setFormErrors((prev) => ({ ...prev, schedule: undefined }));
+                  }
+                }}
+                className={`input bg-[#111b21] text-[#e9edef] p-2 rounded-lg text-sm focus:ring-2 focus:ring-[#00a884] transition-all ${
+                  formErrors.schedule ? 'border-red-500' : ''
+                }`}
+                aria-label="Delivery date"
+                aria-invalid={!!formErrors.schedule}
+              />
+              <input
+                type="time"
+                value={customTime}
+                onChange={(e) => {
+                  setCustomTime(e.target.value);
+                  setSelectedPreset(null);
+                  if (formErrors.schedule) {
+                    setFormErrors((prev) => ({ ...prev, schedule: undefined }));
+                  }
+                }}
+                className={`input bg-[#111b21] text-[#e9edef] p-2 rounded-lg text-sm focus:ring-2 focus:ring-[#00a884] transition-all ${
+                  formErrors.schedule ? 'border-red-500' : ''
+                }`}
+                aria-label="Delivery time"
+                aria-invalid={!!formErrors.schedule}
+                aria-describedby={formErrors.schedule ? 'schedule-error' : undefined}
+              />
+            </div>
+            {formErrors.schedule && (
+              <p id="schedule-error" className="text-xs text-red-400 mt-2" role="alert">
+                {formErrors.schedule}
+              </p>
+            )}
           </div>
-          {formErrors.schedule && (
-            <p id="schedule-error" className="text-xs text-red-400 mt-1" role="alert">
-              {formErrors.schedule}
-            </p>
+
+          {/* Cancellation Window Preview */}
+          {getScheduledTime() && (
+            <div className="mt-3 p-3 bg-[#202c33] rounded-lg">
+              <p className="text-xs text-[#8696a0]">
+                <strong>Cancellation Window:</strong>{' '}
+                {calculateCancellationWindow(getScheduledTime()!).label}
+              </p>
+            </div>
           )}
         </div>
 
@@ -1031,11 +1169,17 @@ const GuardianView: React.FC = () => {
               </p>
             ) : (
               <p className="text-xs text-[#8696a0]">
-                This seals the delivery. After 24 hours, nothing can stop it.
+                This seals the delivery. After the cancellation window, nothing can stop it.
               </p>
             )}
           </div>
         </div>
+
+        {formErrors.credits && (
+          <div className="mt-4 p-3 bg-red-900/20 border border-red-900/50 rounded-xl" role="alert">
+            <p className="text-sm text-red-200">{formErrors.credits}</p>
+          </div>
+        )}
 
         <button
           onClick={handleLock}
@@ -1066,6 +1210,7 @@ const GuardianView: React.FC = () => {
           onSuccess={() => {
             setShowPaymentModal(false);
             refreshUser();
+            loadResourceUsage();
           }}
         />
       )}

@@ -14,7 +14,7 @@
  * - Comprehensive input validation
  * - Type-safe responses (no `any` types)
  *
- * @version 2.0.1
+ * @version 2.0.2
  * @status PRODUCTION
  */
 
@@ -147,13 +147,13 @@ export interface CreditLedgerEntry {
 }
 
 /**
- * System resource usage (for quota tracking)
+ * System resource usage (for quota tracking and credit monitoring)
  */
 export interface ResourceUsage {
+  email_credits_remaining: number;
+  sms_credits_remaining: number;
   storage_used_mb: number;
   storage_limit_mb: number;
-  pending_deliveries: number;
-  delivered_deliveries: number;
 }
 
 // =============================================================================
@@ -607,6 +607,17 @@ export const api = {
     validateSessionToken(sessionToken);
     return circuitBreaker.execute(() =>
       withRetry(() => invokeWithTimeout<Analytics>("get_analytics", { sessionToken }))
+    );
+  },
+
+  /**
+   * Get real-time resource usage (credits, storage quota)
+   * Used by GuardianView for credit monitoring and warnings
+   */
+  getResourceUsage: (sessionToken: string) => {
+    validateSessionToken(sessionToken);
+    return circuitBreaker.execute(() =>
+      invokeWithTimeout<ResourceUsage>("get_resource_usage", { sessionToken })
     );
   },
 
@@ -1147,5 +1158,6 @@ export function getLockoutMinutes(e: unknown): number | null {
   }
   return null;
 }
+
 // Re-export types that components need directly
 export type { UploadResult } from "../types";

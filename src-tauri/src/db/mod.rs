@@ -12,8 +12,10 @@
 //! - Credit operation validation (prevents negative balances)
 //! - Account lockout and failed login tracking (brute force prevention)
 //! - Session limits and management
+//! - Dynamic Guardian cancellation windows
+//! - Real-time resource usage monitoring
 //!
-//! @version 2.0.1
+//! @version 2.0.2
 //! @status PRODUCTION
 
 use std::path::Path;
@@ -44,8 +46,6 @@ static AUDIT_RATE_LIMITER: once_cell::sync::Lazy<Arc<Mutex<RateLimiter>>> =
     once_cell::sync::Lazy::new(|| Arc::new(Mutex::new(RateLimiter::new(MAX_AUDIT_LOGS_PER_MINUTE, 60))));
 
 // Strict column mapping for SQL queries (Must exactly match UserRecord struct)
-// Note: failed_login_attempts and lockout_until are NOT included here because
-// they are internal security fields managed exclusively by auth functions.
 const USER_COLS: &str =
     "id, email, name, password_hash, password_salt, delivery_credits, sms_balance, totp_secret, totp_enabled, tos_version, tos_accepted_at, created_at, heartbeat_interval_days, last_heartbeat_at, subscription_expires_at, registration_bonus_claimed";
 
@@ -107,18 +107,16 @@ pub async fn init_pool(db_path: &Path) -> Result<DbPool, AppError> {
         std::fs::create_dir_all(parent)?;
     }
 
-    // Enterprise-grade SQLite PRAGMAs for maximum reliability and performance
     let options = SqliteConnectOptions::from_str(&db_path.to_string_lossy())
         .map_err(|e| AppError::Config(format!("invalid database path: {e}")))?
         .journal_mode(SqliteJournalMode::Wal)
         .create_if_missing(true)
         .foreign_keys(true)
         .busy_timeout(Duration::from_secs(10))
-        // Performance optimizations
         .pragma("synchronous", "NORMAL")
-        .pragma("cache_size", "-64000") // 64MB cache
+        .pragma("cache_size", "-64000")
         .pragma("temp_store", "MEMORY")
-        .pragma("mmap_size", "268435456"); // 256MB memory-mapped I/O
+        .pragma("mmap_size", "268435456");
 
     let pool = SqlitePoolOptions::new()
         .max_connections(10)
@@ -126,7 +124,6 @@ pub async fn init_pool(db_path: &Path) -> Result<DbPool, AppError> {
         .acquire_timeout(Duration::from_secs(15))
         .idle_timeout(Duration::from_secs(300))
         .max_lifetime(Duration::from_secs(3600))
-        // Connection validation: test each connection before use
         .before_acquire(|conn, _| {
             Box::pin(async move {
                 match sqlx::query("SELECT 1").execute(conn).await {
@@ -141,7 +138,6 @@ pub async fn init_pool(db_path: &Path) -> Result<DbPool, AppError> {
         .connect_with(options)
         .await?;
 
-    // Run migrations and optimizations
     run_migrations(&pool).await?;
     seed_payment_plans(&pool).await?;
     optimize_database(&pool).await?;
@@ -151,7 +147,6 @@ pub async fn init_pool(db_path: &Path) -> Result<DbPool, AppError> {
     Ok(pool)
 }
 
-/// Optimize database performance (run on startup)
 async fn optimize_database(pool: &DbPool) -> Result<(), AppError> {
     sqlx::query("ANALYZE").execute(pool).await?;
     sqlx::query("PRAGMA optimize").execute(pool).await?;
@@ -159,7 +154,6 @@ async fn optimize_database(pool: &DbPool) -> Result<(), AppError> {
     Ok(())
 }
 
-/// Clean up orphaned records (uploads without deliveries, etc.)
 async fn cleanup_orphans(pool: &DbPool) -> Result<(), AppError> {
     let result = sqlx::query(
         "DELETE FROM uploads WHERE used = 0 AND created_at < datetime('now', '-7 days')"
@@ -179,7 +173,6 @@ async fn cleanup_orphans(pool: &DbPool) -> Result<(), AppError> {
 // =============================================================================
 
 async fn run_migrations(pool: &DbPool) -> Result<(), AppError> {
-    // 1. Create all tables with their FINAL, complete schemas.
     let statements: &[&str] = &[
         "CREATE TABLE IF NOT EXISTS users (
             id TEXT PRIMARY KEY,
@@ -298,12 +291,14 @@ async fn run_migrations(pool: &DbPool) -> Result<(), AppError> {
             reference TEXT,
             created_at TEXT NOT NULL
         )",
+        // Guardian locks with dynamic cancellation windows
         "CREATE TABLE IF NOT EXISTS guardian_locks (
             id TEXT PRIMARY KEY,
             user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
             channel TEXT NOT NULL,
             scheduled_for TEXT NOT NULL,
             cooling_off_until TEXT NOT NULL,
+            cancellation_hours INTEGER NOT NULL DEFAULT 24,
             status TEXT NOT NULL DEFAULT 'pending',
             seal_hash TEXT NOT NULL,
             seal_salt TEXT NOT NULL,
@@ -311,9 +306,7 @@ async fn run_migrations(pool: &DbPool) -> Result<(), AppError> {
             created_at TEXT NOT NULL,
             cloud_registered INTEGER NOT NULL DEFAULT 0
         )",
-        // =====================================================================
-        // COMPREHENSIVE INDEXES (10x faster queries)
-        // =====================================================================
+        // Comprehensive indexes
         "CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)",
         "CREATE INDEX IF NOT EXISTS idx_deliveries_status ON deliveries(status)",
         "CREATE INDEX IF NOT EXISTS idx_deliveries_user ON deliveries(user_id)",
@@ -330,20 +323,20 @@ async fn run_migrations(pool: &DbPool) -> Result<(), AppError> {
         "CREATE INDEX IF NOT EXISTS idx_guardian_locks_user ON guardian_locks(user_id)",
         "CREATE INDEX IF NOT EXISTS idx_guardian_locks_status ON guardian_locks(status, cooling_off_until)",
         "CREATE INDEX IF NOT EXISTS idx_guardian_locks_scheduled ON guardian_locks(scheduled_for)",
+        "CREATE INDEX IF NOT EXISTS idx_guardian_locks_cancellation ON guardian_locks(cancellation_hours, status)",
         "CREATE INDEX IF NOT EXISTS idx_payments_reference ON payments(reference)",
         "CREATE INDEX IF NOT EXISTS idx_payments_user ON payments(user_id)",
         "CREATE INDEX IF NOT EXISTS idx_credit_ledger_user ON credit_ledger(user_id)",
         "CREATE INDEX IF NOT EXISTS idx_credit_ledger_created ON credit_ledger(created_at)",
     ];
 
-    // Commit table creations in a single transaction
     let mut tx = pool.begin().await?;
     for stmt in statements {
         sqlx::query(stmt).execute(&mut *tx).await?;
     }
     tx.commit().await?;
 
-    // 2. SELF-HEALING SCHEMA EVOLUTION (with logging)
+    // Self-healing schema evolution
     let heals: &[(&str, &str)] = &[
         ("ALTER TABLE users ADD COLUMN tos_version INTEGER NOT NULL DEFAULT 0", "users.tos_version"),
         ("ALTER TABLE users ADD COLUMN tos_accepted_at TEXT", "users.tos_accepted_at"),
@@ -367,6 +360,7 @@ async fn run_migrations(pool: &DbPool) -> Result<(), AppError> {
         ("ALTER TABLE deliveries ADD COLUMN is_emergency INTEGER NOT NULL DEFAULT 0", "deliveries.is_emergency"),
         ("ALTER TABLE payments ADD COLUMN redeemed_at TEXT", "payments.redeemed_at"),
         ("ALTER TABLE guardian_locks ADD COLUMN cloud_registered INTEGER NOT NULL DEFAULT 0", "guardian_locks.cloud_registered"),
+        ("ALTER TABLE guardian_locks ADD COLUMN cancellation_hours INTEGER NOT NULL DEFAULT 24", "guardian_locks.cancellation_hours"),
     ];
 
     for (sql, column_name) in heals {
@@ -473,7 +467,6 @@ pub async fn delete_expired_sessions(pool: &DbPool) -> Result<u64, AppError> {
     Ok(result.rows_affected())
 }
 
-/// Count active (non-expired) sessions for a user
 pub async fn count_active_sessions(pool: &DbPool, user_id: &str) -> Result<usize, AppError> {
     let count: (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM sessions WHERE user_id = ? AND expires_at > ?"
@@ -485,7 +478,6 @@ pub async fn count_active_sessions(pool: &DbPool, user_id: &str) -> Result<usize
     Ok(count.0 as usize)
 }
 
-/// Delete the oldest N sessions for a user (used to enforce session limits)
 pub async fn delete_oldest_sessions(pool: &DbPool, user_id: &str, count: usize) -> Result<(), AppError> {
     sqlx::query(
         "DELETE FROM sessions WHERE user_id = ? AND token IN (
@@ -506,7 +498,6 @@ pub async fn delete_oldest_sessions(pool: &DbPool, user_id: &str, count: usize) 
 // ACCOUNT LOCKOUT & FAILED LOGIN TRACKING
 // =============================================================================
 
-/// Get account lockout expiration time (None if not locked)
 pub async fn get_account_lockout(pool: &DbPool, email: &str) -> Result<Option<DateTime<Utc>>, AppError> {
     let result: Option<(Option<String>,)> = sqlx::query_as(
         "SELECT lockout_until FROM users WHERE email = ?"
@@ -526,7 +517,6 @@ pub async fn get_account_lockout(pool: &DbPool, email: &str) -> Result<Option<Da
     }
 }
 
-/// Set account lockout until specified time
 pub async fn set_account_lockout(pool: &DbPool, email: &str, until: DateTime<Utc>) -> Result<(), AppError> {
     sqlx::query("UPDATE users SET lockout_until = ? WHERE email = ?")
         .bind(until.to_rfc3339())
@@ -536,7 +526,6 @@ pub async fn set_account_lockout(pool: &DbPool, email: &str, until: DateTime<Utc
     Ok(())
 }
 
-/// Increment failed login attempts and return new count
 pub async fn increment_failed_logins(pool: &DbPool, email: &str) -> Result<u32, AppError> {
     let result = sqlx::query(
         "UPDATE users SET failed_login_attempts = failed_login_attempts + 1 WHERE email = ?"
@@ -559,7 +548,6 @@ pub async fn increment_failed_logins(pool: &DbPool, email: &str) -> Result<u32, 
     Ok(count.0 as u32)
 }
 
-/// Clear failed login attempts and lockout (on successful login)
 pub async fn clear_failed_logins(pool: &DbPool, email: &str) -> Result<(), AppError> {
     sqlx::query(
         "UPDATE users SET failed_login_attempts = 0, lockout_until = NULL WHERE email = ?"
@@ -587,7 +575,6 @@ pub async fn get_upload(pool: &DbPool, file_key: &str, user_id: &str) -> Result<
     Ok(upload)
 }
 
-/// ATOMIC: Mark upload as used (prevents TOCTOU races)
 pub async fn mark_upload_used(pool: &DbPool, file_key: &str, user_id: &str) -> Result<(), AppError> {
     let result = sqlx::query(
         "UPDATE uploads SET used = 1 WHERE file_key = ? AND user_id = ? AND used = 0"
@@ -925,7 +912,7 @@ pub async fn get_credit_ledger(pool: &DbPool, user_id: &str, limit: i64) -> Resu
 }
 
 // =============================================================================
-// GUARDIAN: Irrevocable Vault
+// GUARDIAN: Advanced Irrevocable Vault with Dynamic Cancellation Windows
 // =============================================================================
 
 pub async fn insert_guardian_lock(
@@ -935,16 +922,18 @@ pub async fn insert_guardian_lock(
     channel: &str,
     scheduled_for: DateTime<Utc>,
     cooling_off_until: DateTime<Utc>,
+    cancellation_hours: i64,
     seal_hash: &str,
     seal_salt: &str,
     payload_enc: &str,
     cloud_registered: i64,
 ) -> Result<(), AppError>  {
     sqlx::query(
-        "INSERT INTO guardian_locks (id, user_id, channel, scheduled_for, cooling_off_until, status, seal_hash, seal_salt, payload_enc, created_at, cloud_registered)
-         VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)"
+        "INSERT INTO guardian_locks (id, user_id, channel, scheduled_for, cooling_off_until, cancellation_hours, status, seal_hash, seal_salt, payload_enc, created_at, cloud_registered)
+         VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)"
     )
     .bind(id).bind(user_id).bind(channel).bind(scheduled_for).bind(cooling_off_until)
+    .bind(cancellation_hours)
     .bind(seal_hash).bind(seal_salt).bind(payload_enc).bind(Utc::now()).bind(cloud_registered)
     .execute(pool).await?;
     Ok(())
@@ -968,9 +957,9 @@ pub async fn cancel_guardian_lock(
 pub async fn list_guardian_locks(
     pool: &DbPool,
     user_id: &str,
-) -> Result<Vec<(String, String, String, String, String, String)>, AppError> {
-    let rows = sqlx::query_as::<_, (String, String, String, String, String, String)>(
-        "SELECT id, channel, scheduled_for, cooling_off_until, status, created_at
+) -> Result<Vec<(String, String, String, String, String, String, i64)>, AppError> {
+    let rows = sqlx::query_as::<_, (String, String, String, String, String, String, i64)>(
+        "SELECT id, channel, scheduled_for, cooling_off_until, status, created_at, cancellation_hours
          FROM guardian_locks WHERE user_id = ? ORDER BY created_at DESC LIMIT 100"
     )
     .bind(user_id).fetch_all(pool).await?;
@@ -981,9 +970,9 @@ pub async fn get_guardian_lock(
     pool: &DbPool,
     id: &str,
     user_id: &str,
-) -> Result<Option<(String, String, String, String, String, String, String)>, AppError> {
-    let row = sqlx::query_as::<_, (String, String, String, String, String, String, String)>(
-        "SELECT id, channel, scheduled_for, cooling_off_until, status, seal_salt, payload_enc
+) -> Result<Option<(String, String, String, String, String, String, String, i64)>, AppError> {
+    let row = sqlx::query_as::<_, (String, String, String, String, String, String, String, i64)>(
+        "SELECT id, channel, scheduled_for, cooling_off_until, status, seal_salt, payload_enc, cancellation_hours
          FROM guardian_locks WHERE id = ? AND user_id = ?"
     )
     .bind(id).bind(user_id).fetch_optional(pool).await?;
@@ -1001,6 +990,7 @@ pub async fn mark_guardian_delivered(pool: &DbPool, id: &str) -> Result<(), AppE
     sqlx::query("UPDATE guardian_locks SET status = 'delivered' WHERE id = ?").bind(id).execute(pool).await?;
     Ok(())
 }
+
 /// Get total storage usage for a user (sum of all upload file sizes)
 pub async fn get_user_storage_usage(pool: &DbPool, user_id: &str) -> Result<i64, AppError> {
     let result: (i64,) = sqlx::query_as(
